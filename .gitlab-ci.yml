@@ -1,0 +1,50 @@
+# GitLab CI/CD configuration for air-gapped marimo Pages deployment
+#
+# This pipeline runs on a GitLab runner WITH internet access.
+# It builds a fully self-contained static site and deploys it to GitLab Pages.
+# Browsers accessing the Pages site need NO internet — everything is bundled.
+
+stages:
+  - build
+  - deploy
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+
+# Cache pip downloads between runs to speed up builds
+cache:
+  key: pip-cache
+  paths:
+    - .pip-cache/
+
+build:
+  stage: build
+  image: python:3.12-slim
+  script:
+    - pip install marimo
+    - python scripts/build.py --mode run
+  artifacts:
+    paths:
+      - _site
+    expire_in: 1 hour
+
+pages:
+  stage: deploy
+  script:
+    # GitLab Pages requires the output directory to be named "public"
+    - mv _site public
+  artifacts:
+    paths:
+      - public
+  only:
+    - main
+
+# Optional: Add COOP/COEP headers for SharedArrayBuffer support
+# If your GitLab Pages instance uses nginx, you may need to configure
+# these headers at the GitLab admin level or via a custom domain config:
+#
+#   Cross-Origin-Opener-Policy: same-origin
+#   Cross-Origin-Embedder-Policy: require-corp
+#
+# Without these headers, Pyodide may fall back to a slower single-threaded
+# mode, but should still function correctly.
