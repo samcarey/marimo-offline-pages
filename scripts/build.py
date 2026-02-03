@@ -567,6 +567,85 @@ def download_marimo_base(output_dir, marimo_version):
             print(f"  ⚠ Could not update pyodide-lock.json: {e}")
 
 
+def download_extra_package(output_dir, package_name, imports=None):
+    """Download an extra pure-Python package from PyPI and add to pyodide-lock.json."""
+    pyodide_dir = Path(output_dir) / "pyodide"
+    pyodide_lock = pyodide_dir / "pyodide-lock.json"
+
+    # Normalize package name for filesystem (underscores)
+    pkg_normalized = package_name.lower().replace("-", "_")
+
+    # Check if already present
+    existing = list(pyodide_dir.glob(f"{pkg_normalized}*.whl"))
+    if existing:
+        print(f"  ✓ {package_name} already present: {existing[0].name}")
+        return True
+
+    # Fetch package info from PyPI
+    try:
+        pypi_url = f"https://pypi.org/pypi/{package_name}/json"
+        req = urllib.request.Request(pypi_url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        version = data["info"]["version"]
+        urls = data["releases"].get(version, [])
+
+        # Find py3-none-any wheel
+        wheel_info = None
+        for u in urls:
+            if u["filename"].endswith("-py3-none-any.whl"):
+                wheel_info = u
+                break
+
+        if not wheel_info:
+            print(f"  ⚠ No pure Python wheel found for {package_name}")
+            return False
+
+        wheel_url = wheel_info["url"]
+        wheel_name = wheel_info["filename"]
+        wheel_sha = wheel_info.get("digests", {}).get("sha256", "")
+
+        print(f"  ↓ Downloading {package_name} {version}")
+        download(wheel_url, pyodide_dir / wheel_name)
+
+        # Update pyodide-lock.json
+        if pyodide_lock.exists():
+            lock_data = json.loads(pyodide_lock.read_text())
+            if "packages" in lock_data and package_name.lower() not in lock_data["packages"]:
+                lock_data["packages"][package_name.lower()] = {
+                    "name": package_name.lower(),
+                    "version": version,
+                    "file_name": wheel_name,
+                    "install_dir": "site",
+                    "sha256": wheel_sha,
+                    "depends": [],
+                    "imports": imports or [pkg_normalized]
+                }
+                pyodide_lock.write_text(json.dumps(lock_data, indent=2))
+                print(f"  ✓ Added {package_name} to pyodide-lock.json")
+        return True
+
+    except Exception as e:
+        print(f"  ⚠ Failed to download {package_name}: {e}")
+        return False
+
+
+def download_extra_packages(output_dir):
+    """Download additional packages required by marimo that aren't in Pyodide."""
+    print("\n══════════════════════════════════════════")
+    print("Step 6c: Downloading extra packages")
+    print("══════════════════════════════════════════")
+
+    # Packages marimo needs that aren't in the Pyodide full distribution
+    extra_packages = [
+        ("Markdown", ["markdown"]),  # (package_name, imports)
+    ]
+
+    for pkg_name, imports in extra_packages:
+        download_extra_package(output_dir, pkg_name, imports)
+
+
 def patch_micropip_for_offline(output_dir):
     """
     Patch micropip configuration so packages are loaded from the local
@@ -734,6 +813,9 @@ def main():
     except Exception:
         marimo_version = "0.19.7"  # fallback
     download_marimo_base(output_dir, marimo_version)
+
+    # Step 6c: Download extra packages (Markdown, etc.)
+    download_extra_packages(output_dir)
 
     # Step 7: Configure offline packages
     patch_micropip_for_offline(output_dir)
