@@ -640,6 +640,7 @@ def download_extra_packages(output_dir):
     # Packages marimo needs that aren't in the Pyodide full distribution
     extra_packages = [
         ("Markdown", ["markdown"]),  # (package_name, imports)
+        ("pymdown-extensions", ["pymdownx"]),  # markdown extensions
     ]
 
     for pkg_name, imports in extra_packages:
