@@ -547,8 +547,12 @@ def download_marimo_base(output_dir, marimo_version):
     # Update pyodide-lock.json to include marimo-base
     if pyodide_lock.exists():
         try:
+            import hashlib
             lock_data = json.loads(pyodide_lock.read_text())
             wheel_path = list(pyodide_dir.glob("marimo_base*.whl"))[0]
+
+            # Compute sha256
+            wheel_sha = hashlib.sha256(wheel_path.read_bytes()).hexdigest()
 
             # Add marimo-base entry to packages
             if "packages" in lock_data and "marimo-base" not in lock_data["packages"]:
@@ -557,7 +561,8 @@ def download_marimo_base(output_dir, marimo_version):
                     "version": marimo_version,
                     "file_name": wheel_path.name,
                     "install_dir": "site",
-                    "sha256": "",  # Optional for local files
+                    "sha256": wheel_sha,
+                    "package_type": "package",
                     "depends": [],  # marimo-base has minimal deps for WASM
                     "imports": ["marimo"]
                 }
@@ -619,6 +624,7 @@ def download_extra_package(output_dir, package_name, imports=None):
                     "file_name": wheel_name,
                     "install_dir": "site",
                     "sha256": wheel_sha,
+                    "package_type": "package",
                     "depends": [],
                     "imports": imports or [pkg_normalized]
                 }
