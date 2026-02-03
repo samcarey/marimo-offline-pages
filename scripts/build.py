@@ -106,15 +106,30 @@ def export_notebooks(notebooks_dir, output_dir, mode="run"):
         name = Path(nb).stem
         out = Path(output_dir) / f"{name}"
         print(f"\n  Exporting {nb} → {out}/")
-        run(f"marimo export html-wasm {nb} -o {out} --mode {mode}")
+        run(f"marimo export html-wasm {nb} -o {out} --mode {mode} --force")
 
-    # If there's only one notebook, also copy its index.html to root
+    # If there's only one notebook, create a redirect at the root
     if len(notebooks) == 1:
         name = Path(notebooks[0]).stem
-        src = Path(output_dir) / name / "index.html"
         dst = Path(output_dir) / "index.html"
-        if src.exists() and not dst.exists():
-            shutil.copy2(src, dst)
+        if not dst.exists():
+            # Create a redirect page to the notebook
+            # (Can't just copy the notebook's index.html because asset paths won't work)
+            redirect_html = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="0; url=./{name}/">
+    <title>Redirecting...</title>
+</head>
+<body>
+    <p>Redirecting to <a href="./{name}/">{name}</a>...</p>
+</body>
+</html>
+"""
+            dst.write_text(redirect_html)
+            print(f"  ✓ Created redirect: {dst} → {name}/")
 
     return notebooks
 
@@ -129,19 +144,41 @@ def detect_pyodide_version(output_dir):
     print("Step 2: Detecting Pyodide version")
     print("══════════════════════════════════════════")
 
-    pattern = re.compile(
-        r"cdn\.jsdelivr\.net/pyodide/v([0-9]+\.[0-9]+\.[0-9]+)/full"
-    )
+    # Look for the hardcoded Pyodide version in the worker files
+    # Pattern matches: var Io="0.27.7" or similar version strings
+    patterns = [
+        # Literal CDN URL pattern
+        re.compile(r"cdn\.jsdelivr\.net/pyodide/v([0-9]+\.[0-9]+\.[0-9]+)/full"),
+        # Version string like Io="0.27.7" (Pyodide version constant)
+        re.compile(r'="(0\.[0-9]+\.[0-9]+)"'),
+        # pyodide version in loadPyodide context
+        re.compile(r'pyodide.*?([0-9]+\.[0-9]+\.[0-9]+)'),
+    ]
 
-    for path in Path(output_dir).rglob("*"):
-        if path.suffix in (".js", ".html", ".mjs"):
-            try:
-                text = path.read_text(errors="ignore")
-            except Exception:
-                continue
-            match = pattern.search(text)
-            if match:
-                version = match.group(1)
+    # Look specifically in worker files first (they have the Pyodide loading code)
+    worker_files = list(Path(output_dir).rglob("*worker*.js"))
+    all_js_files = list(Path(output_dir).rglob("*.js"))
+
+    for path in worker_files + all_js_files:
+        try:
+            text = path.read_text(errors="ignore")
+        except Exception:
+            continue
+
+        # First, try to find version in CDN URL pattern
+        match = patterns[0].search(text)
+        if match:
+            version = match.group(1)
+            print(f"  ✓ Found Pyodide version: {version} (in {path})")
+            return version
+
+        # Look for Pyodide version constant (typically 0.2x.x format)
+        # This is more reliable for template literal URLs
+        # Check for both double quotes and backticks
+        for match in re.finditer(r'["`](0\.2[0-9]+\.[0-9]+)["`]', text):
+            version = match.group(1)
+            # Verify it looks like a Pyodide version (0.2x.x)
+            if version.startswith("0.2"):
                 print(f"  ✓ Found Pyodide version: {version} (in {path})")
                 return version
 
@@ -218,17 +255,38 @@ def download_pyodide(version, output_dir):
 # ---------------------------------------------------------------------------
 
 def download_google_fonts(output_dir):
-    """Download Google Fonts CSS and all referenced font files."""
+    """Download Google Fonts CSS and all referenced font files.
+
+    Note: Modern marimo exports bundle fonts directly in the assets/ folder,
+    so this step is often not needed. We check for bundled fonts first.
+    """
     print("\n══════════════════════════════════════════")
-    print("Step 4: Downloading Google Fonts")
+    print("Step 4: Checking/Downloading Google Fonts")
     print("══════════════════════════════════════════")
+
+    # Check if fonts are already bundled in the export (marimo >= 0.19 bundles them)
+    bundled_fonts = list(Path(output_dir).rglob("assets/*.ttf"))
+    if bundled_fonts:
+        font_names = [f.stem.split("-")[0] for f in bundled_fonts]
+        has_fira = any("FiraMono" in f.name for f in bundled_fonts)
+        has_lora = any("Lora" in f.name for f in bundled_fonts)
+        has_pt = any("PTSans" in f.name for f in bundled_fonts)
+        if has_fira and has_lora and has_pt:
+            print(f"  ✓ Fonts already bundled in assets/ ({len(bundled_fonts)} font files)")
+            print("    Skipping Google Fonts download (not needed)")
+            return None
 
     fonts_dir = Path(output_dir) / "fonts"
     fonts_dir.mkdir(parents=True, exist_ok=True)
 
     # Download the CSS with a user-agent that returns woff2 format
     print("  ↓ Fetching font CSS...")
-    css = download_text(GOOGLE_FONTS_CSS_URL, user_agent=WOFF2_USER_AGENT)
+    try:
+        css = download_text(GOOGLE_FONTS_CSS_URL, user_agent=WOFF2_USER_AGENT)
+    except urllib.error.HTTPError as e:
+        print(f"  ⚠ Could not download Google Fonts CSS: {e}")
+        print("    This is OK if fonts are already bundled in the export")
+        return None
 
     # Find all font URLs in the CSS
     font_urls = re.findall(r"url\((https://fonts\.gstatic\.com/[^)]+)\)", css)
@@ -256,10 +314,22 @@ def download_google_fonts(output_dir):
 # ---------------------------------------------------------------------------
 
 def download_katex(output_dir):
-    """Download KaTeX CSS and font files from jsDelivr/npm."""
+    """Download KaTeX CSS and font files from jsDelivr/npm.
+
+    Note: Modern marimo exports bundle KaTeX fonts directly in assets/,
+    so this step is often not needed. We check for bundled fonts first.
+    """
     print("\n══════════════════════════════════════════")
-    print("Step 5: Downloading KaTeX assets")
+    print("Step 5: Checking/Downloading KaTeX assets")
     print("══════════════════════════════════════════")
+
+    # Check if KaTeX fonts are already bundled in the export
+    katex_fonts = list(Path(output_dir).rglob("assets/KaTeX*.ttf"))
+    katex_fonts.extend(list(Path(output_dir).rglob("assets/KaTeX*.woff2")))
+    if katex_fonts:
+        print(f"  ✓ KaTeX fonts already bundled in assets/ ({len(katex_fonts)} files)")
+        print("    Skipping KaTeX download (not needed)")
+        return None
 
     # Detect KaTeX version from exports
     katex_version = None
@@ -277,7 +347,7 @@ def download_katex(output_dir):
                 break
 
     if not katex_version:
-        print("  ℹ No KaTeX reference found in exports, skipping")
+        print("  ℹ No KaTeX CDN reference found in exports, skipping")
         return None
 
     print(f"  ℹ Detected KaTeX version: {katex_version}")
@@ -288,7 +358,11 @@ def download_katex(output_dir):
     # Download main CSS
     css_url = f"https://cdn.jsdelivr.net/npm/katex@{katex_version}/dist/katex.min.css"
     css_path = katex_dir / "katex.min.css"
-    download(css_url, css_path)
+    try:
+        download(css_url, css_path)
+    except urllib.error.HTTPError as e:
+        print(f"  ⚠ Could not download KaTeX CSS: {e}")
+        return None
 
     # Parse the CSS for font references and download them
     css = css_path.read_text()
@@ -318,15 +392,52 @@ def patch_cdn_urls(output_dir, pyodide_version):
     print("Step 6: Patching CDN URLs to local paths")
     print("══════════════════════════════════════════")
 
+    # We need to handle both literal URLs and JavaScript template literals
+    # Template literals use backticks and may have ${...} substitutions
+    #
+    # Path structure: _site/example/assets/worker.js → needs ../../pyodide/
+    # Worker files are in assets/, pyodide is at the _site root level
+
     replacements = [
-        # Pyodide CDN → local pyodide/
+        # Pyodide lockFileURL template literal → local pyodide-lock.json
+        # Matches: lockFileURL:`https://wasm.marimo.app/pyodide-lock.json?v=${e.version}&pyodide=${e.pyodideVersion}`
+        (
+            re.compile(
+                r'lockFileURL:\s*`https://wasm\.marimo\.app/pyodide-lock\.json[^`]*`'
+            ),
+            'lockFileURL:`../../pyodide/pyodide-lock.json`'
+        ),
+        # Pyodide indexURL template literal → local pyodide/
+        # Matches: indexURL:`https://cdn.jsdelivr.net/pyodide/${e.pyodideVersion}/full/`
+        (
+            re.compile(
+                r'indexURL:\s*`https://cdn\.jsdelivr\.net/pyodide/[^`]*`'
+            ),
+            'indexURL:`../../pyodide/`'
+        ),
+        # setCdnUrl call → remove or make no-op (we're loading locally)
+        # Matches: s.setCdnUrl(`https://cdn.jsdelivr.net/pyodide/v${d.version}/full/`)
+        (
+            re.compile(
+                r'\.setCdnUrl\(`https://cdn\.jsdelivr\.net/pyodide/[^`]*`\)'
+            ),
+            '.setCdnUrl(`../../pyodide/`)'
+        ),
+        # Pyodide CDN literal URLs (with version) → local pyodide/
         (
             f"https://cdn.jsdelivr.net/pyodide/v{pyodide_version}/full/",
-            "../pyodide/"
+            "../../pyodide/"
         ),
         (
             f"https://cdn.jsdelivr.net/pyodide/v{pyodide_version}/full",
-            "../pyodide"
+            "../../pyodide"
+        ),
+        # Pyodide CDN generic pattern for any version
+        (
+            re.compile(
+                r'https://cdn\.jsdelivr\.net/pyodide/v[0-9.]+/full/'
+            ),
+            "../../pyodide/"
         ),
         # Google Fonts CSS → local fonts/fonts.css
         (
@@ -352,7 +463,8 @@ def patch_cdn_urls(output_dir, pyodide_version):
             ),
             "../vendor/katex/"
         ),
-        # PyPI for micropip — this one is trickier, handle separately
+        # unpkg.com emoji/icons data → will be downloaded separately
+        # For now, these are optional features that fail gracefully
     ]
 
     patched_count = 0
@@ -385,6 +497,75 @@ def patch_cdn_urls(output_dir, pyodide_version):
 # ---------------------------------------------------------------------------
 # Step 7: Handle PyPI/micropip for additional packages
 # ---------------------------------------------------------------------------
+
+def download_marimo_base(output_dir, marimo_version):
+    """Download the marimo-base wheel for WASM support."""
+    print("\n══════════════════════════════════════════")
+    print(f"Step 6b: Downloading marimo-base {marimo_version}")
+    print("══════════════════════════════════════════")
+
+    pyodide_dir = Path(output_dir) / "pyodide"
+    pyodide_lock = pyodide_dir / "pyodide-lock.json"
+
+    # Check if marimo-base already exists
+    existing = list(pyodide_dir.glob("marimo_base*.whl"))
+    if existing:
+        print(f"  ✓ marimo-base already present: {existing[0].name}")
+        return
+
+    # Download marimo-base wheel
+    wheel_name = f"marimo_base-{marimo_version}-py3-none-any.whl"
+    wheel_url = f"https://files.pythonhosted.org/packages/py3/m/marimo-base/{wheel_name}"
+
+    # Try direct PyPI download
+    try:
+        download(wheel_url, pyodide_dir / wheel_name)
+    except Exception:
+        # Fallback: use pip to download
+        print(f"  ↓ Downloading via pip...")
+        try:
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result = subprocess.run(
+                    ["pip", "download", "--no-deps", "--only-binary=:all:",
+                     f"--dest={tmpdir}", f"marimo-base=={marimo_version}"],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    # Find the downloaded wheel
+                    for f in Path(tmpdir).glob("*.whl"):
+                        shutil.copy(f, pyodide_dir / f.name)
+                        print(f"  ✓ Downloaded: {f.name}")
+                        break
+                else:
+                    print(f"  ⚠ Could not download marimo-base: {result.stderr}")
+                    return
+        except Exception as e:
+            print(f"  ⚠ Could not download marimo-base: {e}")
+            return
+
+    # Update pyodide-lock.json to include marimo-base
+    if pyodide_lock.exists():
+        try:
+            lock_data = json.loads(pyodide_lock.read_text())
+            wheel_path = list(pyodide_dir.glob("marimo_base*.whl"))[0]
+
+            # Add marimo-base entry to packages
+            if "packages" in lock_data and "marimo-base" not in lock_data["packages"]:
+                lock_data["packages"]["marimo-base"] = {
+                    "name": "marimo-base",
+                    "version": marimo_version,
+                    "file_name": wheel_path.name,
+                    "install_dir": "site",
+                    "sha256": "",  # Optional for local files
+                    "depends": [],  # marimo-base has minimal deps for WASM
+                    "imports": ["marimo"]
+                }
+                pyodide_lock.write_text(json.dumps(lock_data, indent=2))
+                print(f"  ✓ Updated pyodide-lock.json with marimo-base")
+        except Exception as e:
+            print(f"  ⚠ Could not update pyodide-lock.json: {e}")
+
 
 def patch_micropip_for_offline(output_dir):
     """
@@ -542,6 +723,17 @@ def main():
 
     # Step 6: Patch CDN URLs
     patch_cdn_urls(output_dir, pyodide_version)
+
+    # Step 6b: Download marimo-base for WASM support
+    try:
+        result = subprocess.run(
+            ["python", "-c", "import marimo; print(marimo.__version__)"],
+            capture_output=True, text=True
+        )
+        marimo_version = result.stdout.strip() if result.returncode == 0 else "0.19.7"
+    except Exception:
+        marimo_version = "0.19.7"  # fallback
+    download_marimo_base(output_dir, marimo_version)
 
     # Step 7: Configure offline packages
     patch_micropip_for_offline(output_dir)
