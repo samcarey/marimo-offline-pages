@@ -106,7 +106,7 @@ def export_notebooks(notebooks_dir, output_dir, mode="run"):
         name = Path(nb).stem
         out = Path(output_dir) / f"{name}"
         print(f"\n  Exporting {nb} → {out}/")
-        run(f"marimo export html-wasm {nb} -o {out} --mode {mode}")
+        run(f"marimo export html-wasm {nb} -o {out} --mode {mode} --force")
 
     # If there's only one notebook, create a redirect at the root
     if len(notebooks) == 1:
