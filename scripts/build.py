@@ -572,19 +572,24 @@ def download_marimo_base(output_dir, marimo_version):
             print(f"  ⚠ Could not update pyodide-lock.json: {e}")
 
 
-def download_extra_package(output_dir, package_name, imports=None):
-    """Download an extra pure-Python package from PyPI and add to pyodide-lock.json."""
+def download_extra_package(output_dir, package_name, imports=None, min_version=None):
+    """Download an extra pure-Python package from PyPI and add to pyodide-lock.json.
+
+    If the package exists in Pyodide but is older than min_version, it will be upgraded.
+    """
     pyodide_dir = Path(output_dir) / "pyodide"
     pyodide_lock = pyodide_dir / "pyodide-lock.json"
 
     # Normalize package name for filesystem (underscores)
     pkg_normalized = package_name.lower().replace("-", "_")
+    pkg_key = package_name.lower()
 
-    # Check if already present
-    existing = list(pyodide_dir.glob(f"{pkg_normalized}*.whl"))
-    if existing:
-        print(f"  ✓ {package_name} already present: {existing[0].name}")
-        return True
+    # Check current version in pyodide-lock.json
+    current_version = None
+    if pyodide_lock.exists():
+        lock_data = json.loads(pyodide_lock.read_text())
+        if pkg_key in lock_data.get("packages", {}):
+            current_version = lock_data["packages"][pkg_key].get("version")
 
     # Fetch package info from PyPI
     try:
@@ -593,8 +598,8 @@ def download_extra_package(output_dir, package_name, imports=None):
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
-        version = data["info"]["version"]
-        urls = data["releases"].get(version, [])
+        latest_version = data["info"]["version"]
+        urls = data["releases"].get(latest_version, [])
 
         # Find py3-none-any wheel
         wheel_info = None
@@ -607,20 +612,40 @@ def download_extra_package(output_dir, package_name, imports=None):
             print(f"  ⚠ No pure Python wheel found for {package_name}")
             return False
 
+        # Check if we need to download (new package or upgrade needed)
+        need_download = False
+        if current_version is None:
+            need_download = True
+        elif current_version != latest_version:
+            # Compare versions - download if PyPI has newer
+            from packaging.version import Version
+            if Version(latest_version) > Version(current_version):
+                print(f"  ↑ Upgrading {package_name}: {current_version} → {latest_version}")
+                need_download = True
+                # Remove old wheel files
+                for old_whl in pyodide_dir.glob(f"{pkg_normalized}*.whl"):
+                    old_whl.unlink()
+            else:
+                print(f"  ✓ {package_name} {current_version} already up to date")
+                return True
+        else:
+            print(f"  ✓ {package_name} {current_version} already present")
+            return True
+
         wheel_url = wheel_info["url"]
         wheel_name = wheel_info["filename"]
         wheel_sha = wheel_info.get("digests", {}).get("sha256", "")
 
-        print(f"  ↓ Downloading {package_name} {version}")
+        print(f"  ↓ Downloading {package_name} {latest_version}")
         download(wheel_url, pyodide_dir / wheel_name)
 
-        # Update pyodide-lock.json
+        # Update pyodide-lock.json (add or update entry)
         if pyodide_lock.exists():
             lock_data = json.loads(pyodide_lock.read_text())
-            if "packages" in lock_data and package_name.lower() not in lock_data["packages"]:
-                lock_data["packages"][package_name.lower()] = {
-                    "name": package_name.lower(),
-                    "version": version,
+            if "packages" in lock_data:
+                lock_data["packages"][pkg_key] = {
+                    "name": pkg_key,
+                    "version": latest_version,
                     "file_name": wheel_name,
                     "install_dir": "site",
                     "sha256": wheel_sha,
@@ -629,7 +654,10 @@ def download_extra_package(output_dir, package_name, imports=None):
                     "imports": imports or [pkg_normalized]
                 }
                 pyodide_lock.write_text(json.dumps(lock_data, indent=2))
-                print(f"  ✓ Added {package_name} to pyodide-lock.json")
+                if current_version:
+                    print(f"  ✓ Updated {package_name} in pyodide-lock.json")
+                else:
+                    print(f"  ✓ Added {package_name} to pyodide-lock.json")
         return True
 
     except Exception as e:
@@ -644,9 +672,15 @@ def download_extra_packages(output_dir):
     print("══════════════════════════════════════════")
 
     # Packages marimo needs that aren't in the Pyodide full distribution
+    # or need newer versions than Pyodide provides
     extra_packages = [
-        ("Markdown", ["markdown"]),  # (package_name, imports)
-        ("pymdown-extensions", ["pymdownx"]),  # markdown extensions
+        # Core marimo dependencies not in Pyodide
+        ("Markdown", ["markdown"]),
+        ("pymdown-extensions", ["pymdownx"]),
+        ("tomlkit", ["tomlkit"]),
+        ("itsdangerous", ["itsdangerous"]),
+        # narwhals 2.x needed (Pyodide has 1.41, marimo needs >=2.0 for stable.v2)
+        ("narwhals", ["narwhals"]),
     ]
 
     for pkg_name, imports in extra_packages:
