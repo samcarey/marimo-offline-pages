@@ -31,7 +31,7 @@ jobs:
           # Add any other build-time dependencies here
 
       - name: Build offline site
-        run: python scripts/build.py --mode run
+        run: python scripts/build.py --mode edit
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

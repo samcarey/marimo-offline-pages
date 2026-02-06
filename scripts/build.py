@@ -817,8 +817,8 @@ def main():
         help="Output directory for the static site (default: _site)"
     )
     parser.add_argument(
-        "--mode", default="run", choices=["run", "edit"],
-        help="Export mode: 'run' for readonly, 'edit' for editable (default: run)"
+        "--mode", default="edit", choices=["run", "edit"],
+        help="Export mode: 'run' for readonly, 'edit' for editable (default: edit)"
     )
     parser.add_argument(
         "--pyodide-version", default=None,
