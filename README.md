@@ -1,4 +1,5 @@
 # marimo-offline-pages
+<!-- CI test -->
 
 Deploy [marimo](https://marimo.io) WASM notebooks to GitLab Pages (or GitHub
 Pages) with **zero internet dependency at runtime**. Everything — Pyodide,
