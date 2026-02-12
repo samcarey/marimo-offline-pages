@@ -592,8 +592,15 @@ def patch_wasm_share_links(output_dir):
     #
     # When someone opens a URL with #code/…, we remove the <marimo-code>
     # element so that marimo's urlFileStore reads from the hash instead.
-    hash_handler_script = """\
-    <script data-marimo-share="true">
+    #
+    # IMPORTANT: This script MUST appear AFTER <marimo-code> in the HTML.
+    # Inline (non-module) scripts execute synchronously during parsing, so
+    # they can only see DOM elements that have already been parsed.  If the
+    # script were placed before <marimo-code>, querySelector would return
+    # null.  Placing it right after </marimo-code> guarantees the element
+    # exists in the DOM when the script runs, and it still executes before
+    # the deferred module scripts that initialize marimo's file stores.
+    hash_handler_script = """\n<script data-marimo-share="true">
     (function(){
       // --- Receiving side: handle incoming #code/… share links ---
       // marimo's file-store checks <marimo-code> before the URL hash, so
@@ -626,19 +633,17 @@ def patch_wasm_share_links(output_dir):
         if 'data-marimo-share' in text:
             continue
 
-        # Insert before the first <script> that loads marimo's JS
-        # (the module script tag with src=./assets/index-*.js)
-        insert_re = re.compile(
-            r'(<script type="module" crossorigin src="\./assets/index-[^"]+\.js"></script>)'
-        )
+        # Insert AFTER </marimo-code> — the element must already be in the
+        # DOM when this inline script runs during HTML parsing.
+        insert_re = re.compile(r'(</marimo-code>)')
         m = insert_re.search(text)
         if m:
-            text = text[:m.start()] + hash_handler_script + "\n    " + text[m.start():]
+            text = text[:m.end()] + hash_handler_script + text[m.end():]
             path.write_text(text)
             patched += 1
             print(f"  ✓ Injected URL-hash handler: {path}")
         else:
-            print(f"  ⚠ Could not find module script tag in {path}")
+            print(f"  ⚠ Could not find </marimo-code> in {path}")
 
     print(f"  ✓ Patched {patched} files for share-link support")
 
