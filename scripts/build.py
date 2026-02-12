@@ -515,9 +515,11 @@ def patch_publish_button(output_dir):
         text = path.read_text(errors="ignore")
         # In the minified JS the menu item looks like:
         #   {icon:V,label:"Publish HTML to web",hidden:K,handle:_}
-        # Replace `hidden:<var>` with `hidden:!0` (always hidden).
+        #   {icon:V,label:"Publish HTML to web",hidden:!H,handle:_}
+        # Replace `hidden:<expr>` with `hidden:!0` (always hidden).
+        # The value may be a variable (K), negated variable (!H), etc.
         new_text = re.sub(
-            r'(label:"Publish HTML to web",hidden:)\w+',
+            r'(label:"Publish HTML to web",hidden:)[^,]+',
             r'\g<1>!0',
             text,
         )
@@ -535,7 +537,7 @@ def patch_publish_button(output_dir):
             if "Publish HTML to web" not in text:
                 continue
             new_text = re.sub(
-                r'(label:"Publish HTML to web",hidden:)\w+',
+                r'(label:"Publish HTML to web",hidden:)[^,]+',
                 r'\g<1>!0',
                 text,
             )
