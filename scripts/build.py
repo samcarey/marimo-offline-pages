@@ -900,22 +900,36 @@ def patch_share_layout_embed(output_dir):
             print(f"  ⚠ WARNING: Could not find .serializeLayout( in {path}")
             continue
 
-        # Find the enclosing function (last "function X()" before the call)
-        fn_matches = list(re.finditer(r'function (\w+)\(\)\{', text[:ser_idx]))
+        # Find the enclosing function.  In minified builds this is either:
+        #   wr=function(){...serializeLayout...}   (assignment expression)
+        #   function wr(){...serializeLayout...}    (function declaration)
+        # Try assignment form first (more common in Vite/Rollup output).
+        fn_matches = list(re.finditer(
+            r'(\w+)=function\(\)\{', text[:ser_idx]
+        ))
+        if not fn_matches:
+            fn_matches = list(re.finditer(
+                r'function (\w+)\(\)\{', text[:ser_idx]
+            ))
         if not fn_matches:
             print(f"  ⚠ WARNING: Could not find enclosing function "
                   f"for serializeLayout in {path}")
             continue
         fn_name = fn_matches[-1].group(1)
 
-        # Expose as global before export{
+        # Expose as a lazy global before export{.  The function variable
+        # is declared at module scope but assigned inside the TLA
+        # (Promise.all().then()) callback, so it is still undefined when
+        # the module body runs.  A wrapper defers the call until the user
+        # actually clicks Share, by which time the TLA has resolved.
         export_match = re.search(r'export\{', text)
         if not export_match:
             print(f"  ⚠ WARNING: Could not find export{{ in {path}")
             continue
         insert_pos = export_match.start()
         text = (text[:insert_pos]
-                + f'window.__marimoGetSerializedLayout={fn_name};'
+                + f'window.__marimoGetSerializedLayout='
+                + f'function(){{return {fn_name}()}};'
                 + text[insert_pos:])
         path.write_text(text)
         print(f"  ✓ Exposed getSerializedLayout as global: {path}")
