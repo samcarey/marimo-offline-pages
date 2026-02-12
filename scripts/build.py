@@ -465,6 +465,16 @@ def patch_cdn_urls(output_dir, pyodide_version):
         ),
         # unpkg.com emoji/icons data → will be downloaded separately
         # For now, these are optional features that fail gracefully
+
+        # Share "Create WebAssembly Link" → use current page URL instead of marimo.app
+        # Matches: baseUrl:C="https://marimo.app" (default param in destructuring)
+        # Replace the default so the share link points to the current deployment.
+        (
+            re.compile(
+                r'''(baseUrl:\w+=)"https://marimo\.app"'''
+            ),
+            r'\1window.location.href.replace(/#.*/,"")'
+        ),
     ]
 
     patched_count = 0
