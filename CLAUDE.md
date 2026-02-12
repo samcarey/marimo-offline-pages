@@ -84,6 +84,42 @@ The patch script must handle these URL patterns:
 - `https://fonts.gstatic.com/...` → `./fonts/...`
 - PyPI URLs in micropip → local wheel paths
 
+## Share Link Patching (`patch_wasm_share_links` in build.py)
+
+The "Create WebAssembly link" feature requires two patches for self-hosted
+exports:
+
+### Generating links (share-*.js)
+
+marimo's share function hardcodes `baseUrl: "https://marimo.app"` and reads
+code via `readCode()` on a SaveWorker (separate Web Worker with its own Pyodide
+instance). Two issues:
+
+- **Wrong domain**: The `baseUrl` default is replaced with
+  `window.location.href.replace(/#.*/, "")` so links point to the self-hosted
+  site.
+- **Empty code before worker ready**: If the SaveWorker hasn't loaded yet,
+  `readCode()` returns empty. The patched function falls back to decompressing
+  the current `#code/…` URL hash (which marimo's `urlFileStore.saveFile()`
+  updates on every save). If still empty, it throws an error so the user sees
+  an alert instead of getting a broken link.
+
+### Loading shared links (index.html)
+
+marimo's `CompositeFileStore` checks `domElementFileStore` (reads `<marimo-code>`
+DOM element) **before** `urlFileStore` (reads `#code/…` hash). Since self-hosted
+exports always have `<marimo-code>` embedded in the HTML, the URL hash is
+ignored.
+
+Fix: An inline `<script>` removes `<marimo-code>` when `#code/` is present in
+the URL hash, letting `urlFileStore` take over.
+
+**Critical placement rule**: The inline script MUST be injected **after**
+`</marimo-code>` in the HTML, not before. Inline (non-module) scripts execute
+synchronously during HTML parsing and can only see elements that have already
+been parsed. Module scripts (`<script type="module">`) are deferred until the
+full document is parsed, so the removal happens before marimo's JS runs.
+
 ## Important Notes
 
 - The Pyodide "full" distribution is ~200MB (includes all bundled packages).
