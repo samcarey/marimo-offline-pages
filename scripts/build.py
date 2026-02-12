@@ -494,6 +494,112 @@ def patch_cdn_urls(output_dir, pyodide_version):
     print(f"  ✓ Patched {patched_count} files total")
 
 
+def patch_wasm_share_links(output_dir):
+    """Patch the exported WASM notebooks so that 'Create WebAssembly link' works.
+
+    Two problems exist in self-hosted marimo WASM exports:
+
+    1. **Generating share links**: The 'Create WebAssembly link' button calls
+       readCode() on a SaveWorker (a separate Web Worker with its own Pyodide
+       instance).  If that worker hasn't fully loaded yet, readCode() returns
+       empty and the share URL has no #code/… fragment.  We patch the share
+       function to fall back to reading from the <marimo-code> DOM element.
+
+    2. **Loading share links**: marimo's file-store chain checks the
+       <marimo-code> DOM element *before* the URL hash.  For self-hosted
+       exports the element always exists, so #code/… is ignored.  We inject a
+       small inline script that removes <marimo-code> when a #code/ hash is
+       present, letting marimo's urlFileStore take over.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 6a: Patching WASM share link support")
+    print("══════════════════════════════════════════")
+
+    patched = 0
+
+    # --- Part 1: Patch share-*.js to fall back to <marimo-code> ----------
+    #
+    # The share function looks like (minified):
+    #   function X(w){let{code:y,baseUrl:C=...}=w,g=new URL(C);
+    #     return y&&(g.hash=`#code/${...compress(y)}`),g.href}
+    #
+    # When readCode() returns empty (save worker not ready), the code var
+    # is falsy and no #code/ hash is generated.  We inject a fallback that
+    # reads the original code from the <marimo-code> DOM element.
+    for path in Path(output_dir).rglob("share-*.js"):
+        text = path.read_text(errors="ignore")
+
+        # Match the share function up to the "return" keyword.
+        # Group 2 captures the minified variable name for "code".
+        share_re = re.compile(
+            r'(function \w+\(\w+\)\{let\{code:(\w+),baseUrl:\w+='
+            r'[^}]+\}=\w+,\w+=new URL\(\w+\);)'
+            r'(return )'
+        )
+        match = share_re.search(text)
+        if match:
+            code_var = match.group(2)
+            # Insert: if code is falsy, reassign it from <marimo-code>
+            fallback = (
+                f'if(!{code_var}){{'
+                f'var _el=document.querySelector("marimo-code");'
+                f'if(_el){code_var}=decodeURIComponent('
+                f'_el.textContent||"").trim()}}'
+            )
+            insert_pos = match.end() - len(match.group(3))
+            text = text[:insert_pos] + fallback + text[insert_pos:]
+            path.write_text(text)
+            patched += 1
+            print(f"  ✓ Patched share function: {path}")
+        else:
+            print(f"  ⚠ Could not find share function pattern in {path}")
+
+    # --- Part 2: Inject URL-hash handler into each notebook index.html ---
+    #
+    # When someone opens a URL with #code/…, we remove the <marimo-code>
+    # element so that marimo's urlFileStore reads from the hash instead.
+    hash_handler_script = """\
+    <script data-marimo-share="true">
+    // Handle incoming #code/… share links for self-hosted WASM notebooks.
+    // marimo's file-store checks <marimo-code> before the URL hash, so we
+    // remove the element when a hash is present to let the hash take over.
+    (function(){
+      var h=window.location.hash;
+      if(h&&h.indexOf("#code/")===0){
+        var el=document.querySelector("marimo-code");
+        if(el)el.remove();
+      }
+    })();
+    </script>"""
+
+    for path in Path(output_dir).rglob("*/index.html"):
+        # Skip the root index.html (redirect page)
+        if path.parent == Path(output_dir):
+            continue
+
+        text = path.read_text(errors="ignore")
+
+        # Already patched?
+        if 'data-marimo-share' in text:
+            continue
+
+        # Insert before the first <script> that loads marimo's JS
+        # (the module script tag with src=./assets/index-*.js)
+        insert_re = re.compile(
+            r'(<script type="module" crossorigin src="\./assets/index-[^"]+\.js"></script>)'
+        )
+        m = insert_re.search(text)
+        if m:
+            text = text[:m.start()] + hash_handler_script + "\n    " + text[m.start():]
+            path.write_text(text)
+            patched += 1
+            print(f"  ✓ Injected URL-hash handler: {path}")
+        else:
+            print(f"  ⚠ Could not find module script tag in {path}")
+
+    print(f"  ✓ Patched {patched} files for share-link support")
+
+
 # ---------------------------------------------------------------------------
 # Step 7: Handle PyPI/micropip for additional packages
 # ---------------------------------------------------------------------------
@@ -843,6 +949,9 @@ def main():
 
     # Step 6: Patch CDN URLs
     patch_cdn_urls(output_dir, pyodide_version)
+
+    # Step 6a: Patch WASM share link support
+    patch_wasm_share_links(output_dir)
 
     # Step 6b: Download marimo-base for WASM support
     try:
