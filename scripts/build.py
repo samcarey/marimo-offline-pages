@@ -102,34 +102,17 @@ def export_notebooks(notebooks_dir, output_dir, mode="run"):
         print(f"  ✗ No .py notebooks found in {notebooks_dir}")
         sys.exit(1)
 
+    single_notebook = len(notebooks) == 1
+
     for nb in notebooks:
         name = Path(nb).stem
-        out = Path(output_dir) / f"{name}"
+        # Single notebook: export directly to root so it's served at /
+        if single_notebook:
+            out = Path(output_dir)
+        else:
+            out = Path(output_dir) / f"{name}"
         print(f"\n  Exporting {nb} → {out}/")
         run(f"marimo export html-wasm {nb} -o {out} --mode {mode} --force")
-
-    # If there's only one notebook, create a redirect at the root
-    if len(notebooks) == 1:
-        name = Path(notebooks[0]).stem
-        dst = Path(output_dir) / "index.html"
-        if not dst.exists():
-            # Create a redirect page to the notebook
-            # (Can't just copy the notebook's index.html because asset paths won't work)
-            redirect_html = f"""\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="0; url=./{name}/">
-    <title>Redirecting...</title>
-</head>
-<body>
-    <p>Redirecting to <a href="./{name}/">{name}</a>...</p>
-</body>
-</html>
-"""
-            dst.write_text(redirect_html)
-            print(f"  ✓ Created redirect: {dst} → {name}/")
 
     return notebooks
 
@@ -386,7 +369,7 @@ def download_katex(output_dir):
 # Step 6: Patch all CDN URLs
 # ---------------------------------------------------------------------------
 
-def patch_cdn_urls(output_dir, pyodide_version):
+def patch_cdn_urls(output_dir, pyodide_version, single_notebook=False):
     """Rewrite all CDN URLs in exported files to relative local paths."""
     print("\n══════════════════════════════════════════")
     print("Step 6: Patching CDN URLs to local paths")
@@ -395,8 +378,20 @@ def patch_cdn_urls(output_dir, pyodide_version):
     # We need to handle both literal URLs and JavaScript template literals
     # Template literals use backticks and may have ${...} substitutions
     #
-    # Path structure: _site/example/assets/worker.js → needs ../../pyodide/
-    # Worker files are in assets/, pyodide is at the _site root level
+    # Path depth depends on layout:
+    #   Multi-notebook:  _site/{name}/assets/worker.js → ../../pyodide/
+    #   Single notebook: _site/assets/worker.js        → ../pyodide/
+    #
+    # Worker/JS files are in assets/, pyodide is at the _site root level.
+    # HTML files (index.html) reference fonts/katex relative to their dir.
+    if single_notebook:
+        pyodide_from_assets = "../pyodide"
+        fonts_from_notebook = "./fonts"
+        katex_from_notebook = "./vendor/katex"
+    else:
+        pyodide_from_assets = "../../pyodide"
+        fonts_from_notebook = "../fonts"
+        katex_from_notebook = "../vendor/katex"
 
     replacements = [
         # Pyodide lockFileURL template literal → local pyodide-lock.json
@@ -405,7 +400,7 @@ def patch_cdn_urls(output_dir, pyodide_version):
             re.compile(
                 r'lockFileURL:\s*`https://wasm\.marimo\.app/pyodide-lock\.json[^`]*`'
             ),
-            'lockFileURL:`../../pyodide/pyodide-lock.json`'
+            f'lockFileURL:`{pyodide_from_assets}/pyodide-lock.json`'
         ),
         # Pyodide indexURL template literal → local pyodide/
         # Matches: indexURL:`https://cdn.jsdelivr.net/pyodide/${e.pyodideVersion}/full/`
@@ -413,7 +408,7 @@ def patch_cdn_urls(output_dir, pyodide_version):
             re.compile(
                 r'indexURL:\s*`https://cdn\.jsdelivr\.net/pyodide/[^`]*`'
             ),
-            'indexURL:`../../pyodide/`'
+            f'indexURL:`{pyodide_from_assets}/`'
         ),
         # setCdnUrl call → remove or make no-op (we're loading locally)
         # Matches: s.setCdnUrl(`https://cdn.jsdelivr.net/pyodide/v${d.version}/full/`)
@@ -421,23 +416,23 @@ def patch_cdn_urls(output_dir, pyodide_version):
             re.compile(
                 r'\.setCdnUrl\(`https://cdn\.jsdelivr\.net/pyodide/[^`]*`\)'
             ),
-            '.setCdnUrl(`../../pyodide/`)'
+            f'.setCdnUrl(`{pyodide_from_assets}/`)'
         ),
         # Pyodide CDN literal URLs (with version) → local pyodide/
         (
             f"https://cdn.jsdelivr.net/pyodide/v{pyodide_version}/full/",
-            "../../pyodide/"
+            f"{pyodide_from_assets}/"
         ),
         (
             f"https://cdn.jsdelivr.net/pyodide/v{pyodide_version}/full",
-            "../../pyodide"
+            f"{pyodide_from_assets}"
         ),
         # Pyodide CDN generic pattern for any version
         (
             re.compile(
                 r'https://cdn\.jsdelivr\.net/pyodide/v[0-9.]+/full/'
             ),
-            "../../pyodide/"
+            f"{pyodide_from_assets}/"
         ),
         # Google Fonts CSS → local fonts/fonts.css
         (
@@ -445,7 +440,7 @@ def patch_cdn_urls(output_dir, pyodide_version):
                 r'https://fonts\.googleapis\.com/css2\?'
                 r'family=Fira\+Mono[^"\'>\s]*'
             ),
-            "../fonts/fonts.css"
+            f"{fonts_from_notebook}/fonts.css"
         ),
         # Google Fonts preconnect hints (remove or replace)
         (
@@ -461,7 +456,7 @@ def patch_cdn_urls(output_dir, pyodide_version):
             re.compile(
                 r'https://cdn\.jsdelivr\.net/npm/katex@[0-9.]+/dist/'
             ),
-            "../vendor/katex/"
+            f"{katex_from_notebook}/"
         ),
         # unpkg.com emoji/icons data → will be downloaded separately
         # For now, these are optional features that fail gracefully
@@ -504,7 +499,7 @@ def patch_cdn_urls(output_dir, pyodide_version):
     print(f"  ✓ Patched {patched_count} files total")
 
 
-def patch_wasm_share_links(output_dir):
+def patch_wasm_share_links(output_dir, single_notebook=False):
     """Patch the exported WASM notebooks so that 'Create WebAssembly link' works.
 
     Two problems exist in self-hosted marimo WASM exports:
@@ -632,10 +627,17 @@ def patch_wasm_share_links(output_dir):
     })();
     </script>"""
 
-    for path in Path(output_dir).rglob("*/index.html"):
-        # Skip the root index.html (redirect page)
-        if path.parent == Path(output_dir):
-            continue
+    if single_notebook:
+        # Single notebook: the root index.html IS the notebook
+        notebook_htmls = [Path(output_dir) / "index.html"]
+    else:
+        # Multi notebook: each notebook is in a subdirectory
+        notebook_htmls = [
+            p for p in Path(output_dir).rglob("*/index.html")
+            if p.parent != Path(output_dir)
+        ]
+
+    for path in notebook_htmls:
 
         text = path.read_text(errors="ignore")
 
@@ -1006,10 +1008,11 @@ def main():
     download_katex(output_dir)
 
     # Step 6: Patch CDN URLs
-    patch_cdn_urls(output_dir, pyodide_version)
+    single_notebook = len(notebooks) == 1
+    patch_cdn_urls(output_dir, pyodide_version, single_notebook=single_notebook)
 
     # Step 6a: Patch WASM share link support
-    patch_wasm_share_links(output_dir)
+    patch_wasm_share_links(output_dir, single_notebook=single_notebook)
 
     # Step 6b: Download marimo-base for WASM support
     try:
