@@ -578,6 +578,17 @@ def patch_wasm_share_links(output_dir, single_notebook=False):
                     f'{code_var}=(0,{lz_alias}.decompressFromEncodedURIComponent)'
                     f'(_h.slice(6))}}'
                 )
+            # Fallback to <marimo-code> DOM element (original notebook code).
+            # On first load before any save, the URL hash is empty and the
+            # save worker hasn't initialised yet, but <marimo-code> always
+            # has the notebook code (URL-encoded).  decodeURIComponent gives
+            # us the raw Python source, which the share function then
+            # compresses into the #code/… hash fragment.
+            parts.append(
+                f'if(!{code_var}){{'
+                f'var _el=document.querySelector("marimo-code");'
+                f'if(_el){code_var}=decodeURIComponent(_el.textContent||"").trim()}}'
+            )
             # If still no code, refuse — don't silently give a broken URL
             parts.append(
                 f'if(!{code_var}){{throw new Error('
