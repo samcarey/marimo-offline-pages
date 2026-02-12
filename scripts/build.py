@@ -864,6 +864,107 @@ def patch_wasm_share_links(output_dir, single_notebook=False):
     print(f"  ✓ Patched {patched} files for share-link support")
 
 
+def patch_share_layout_embed(output_dir):
+    """Embed grid/slides layout positions into share link code.
+
+    When a user creates a share link from a grid or slides layout, this patch
+    ensures the full cell positions (x, y, w, h) are serialized into the
+    Python code as a ``layout_file="data:application/json;base64,..."``
+    parameter on ``marimo.App(...)``.
+
+    Two JS files are patched:
+
+    1. **layout-*.js** — Exposes the internal ``getSerializedLayout()``
+       function as ``window.__marimoGetSerializedLayout`` so the share
+       function can call it.
+
+    2. **share-*.js** — After the existing fallback chain (which populates
+       the code variable), injects logic that:
+       a) Calls ``getSerializedLayout()`` to get the current layout data
+       b) JSON-stringifies and base64-encodes it into a data URI
+       c) Injects ``layout_file="data:..."`` into ``marimo.App(...)`` in
+          the Python source (or replaces an existing ``layout_file``).
+
+    This function MUST run after ``patch_wasm_share_links`` because it
+    depends on the error-throw anchor that function injects.
+    """
+    print("\n  ── Embedding layout positions in share links ──")
+
+    # --- Part A: Expose getSerializedLayout() as a global -----------------
+    for path in Path(output_dir).rglob("layout-*.js"):
+        text = path.read_text(errors="ignore")
+
+        # Find .serializeLayout( — unique to getSerializedLayout()
+        ser_idx = text.find('.serializeLayout(')
+        if ser_idx == -1:
+            print(f"  ⚠ WARNING: Could not find .serializeLayout( in {path}")
+            continue
+
+        # Find the enclosing function (last "function X()" before the call)
+        fn_matches = list(re.finditer(r'function (\w+)\(\)\{', text[:ser_idx]))
+        if not fn_matches:
+            print(f"  ⚠ WARNING: Could not find enclosing function "
+                  f"for serializeLayout in {path}")
+            continue
+        fn_name = fn_matches[-1].group(1)
+
+        # Expose as global before export{
+        export_match = re.search(r'export\{', text)
+        if not export_match:
+            print(f"  ⚠ WARNING: Could not find export{{ in {path}")
+            continue
+        insert_pos = export_match.start()
+        text = (text[:insert_pos]
+                + f'window.__marimoGetSerializedLayout={fn_name};'
+                + text[insert_pos:])
+        path.write_text(text)
+        print(f"  ✓ Exposed getSerializedLayout as global: {path}")
+
+    # --- Part B: Inject layout embedding in share function ----------------
+    for path in Path(output_dir).rglob("share-*.js"):
+        text = path.read_text(errors="ignore")
+
+        # Find the code variable from the error-throw pattern injected by
+        # patch_wasm_share_links.
+        var_match = re.search(
+            r'if\(!(\w+)\)\{throw new Error\("Notebook still loading',
+            text,
+        )
+        if not var_match:
+            print(f"  ⚠ WARNING: Could not find error-throw pattern in {path}")
+            continue
+        code_var = var_match.group(1)
+
+        # Find the insertion point: after the error throw's closing }
+        anchor = ('throw new Error("Notebook still loading. '
+                  'Please wait and try again.")}')
+        anchor_idx = text.find(anchor)
+        if anchor_idx == -1:
+            print(f"  ⚠ WARNING: Could not find error anchor in {path}")
+            continue
+        insert_pos = anchor_idx + len(anchor)
+
+        # Inject layout embedding code
+        injection = (
+            f'var _gsl=window.__marimoGetSerializedLayout;'
+            f'if(_gsl){{var _ld=_gsl();if(_ld){{'
+            f'var _lj=JSON.stringify(_ld);'
+            f'var _lb=btoa(_lj);'
+            f'var _luri="data:application/json;base64,"+_lb;'
+            f'if({code_var}.indexOf("layout_file=")!==-1)'
+            f'{code_var}={code_var}.replace(/layout_file=["\'][^"\']*["\']/,'
+            f'\'layout_file="\'+_luri+\'"\');'
+            f'else if({code_var}.indexOf("marimo.App(")!==-1)'
+            f'{code_var}={code_var}.replace("marimo.App(",'
+            f'\'marimo.App(layout_file="\'+_luri+\'\\",\');'
+            f'}}}}'
+        )
+
+        text = text[:insert_pos] + injection + text[insert_pos:]
+        path.write_text(text)
+        print(f"  ✓ Injected layout embedding in share function: {path}")
+
+
 # ---------------------------------------------------------------------------
 # Step 7: Handle PyPI/micropip for additional packages
 # ---------------------------------------------------------------------------
@@ -1224,6 +1325,9 @@ def main():
 
     # Step 6a: Patch WASM share link support
     patch_wasm_share_links(output_dir, single_notebook=single_notebook)
+
+    # Step 6a-3: Embed layout positions in share link code
+    patch_share_layout_embed(output_dir)
 
     # Step 6b: Download marimo-base for WASM support
     try:
