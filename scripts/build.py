@@ -499,6 +499,54 @@ def patch_cdn_urls(output_dir, pyodide_version, single_notebook=False):
     print(f"  ✓ Patched {patched_count} files total")
 
 
+def patch_publish_button(output_dir):
+    """Remove the 'Publish HTML to web' menu item from the notebook UI.
+
+    This item posts the notebook's HTML to static.marimo.app, which is
+    undesirable for air-gapped / sensitive deployments.  We force the menu
+    item's ``hidden`` flag to ``true`` so it never appears.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 6a-0: Removing 'Publish HTML to web' button")
+    print("══════════════════════════════════════════")
+
+    patched = 0
+    for path in Path(output_dir).rglob("useNotebookActions-*.js"):
+        text = path.read_text(errors="ignore")
+        # In the minified JS the menu item looks like:
+        #   {icon:V,label:"Publish HTML to web",hidden:K,handle:_}
+        # Replace `hidden:<var>` with `hidden:!0` (always hidden).
+        new_text = re.sub(
+            r'(label:"Publish HTML to web",hidden:)\w+',
+            r'\g<1>!0',
+            text,
+        )
+        if new_text != text:
+            path.write_text(new_text)
+            patched += 1
+            print(f"  ✓ Removed publish button: {path}")
+        else:
+            print(f"  ⚠ 'Publish HTML to web' pattern not found in {path}")
+
+    if patched == 0:
+        # Try broader search in case the chunk name changed
+        for path in Path(output_dir).rglob("*.js"):
+            text = path.read_text(errors="ignore")
+            if "Publish HTML to web" not in text:
+                continue
+            new_text = re.sub(
+                r'(label:"Publish HTML to web",hidden:)\w+',
+                r'\g<1>!0',
+                text,
+            )
+            if new_text != text:
+                path.write_text(new_text)
+                patched += 1
+                print(f"  ✓ Removed publish button: {path}")
+
+    print(f"  ✓ Patched {patched} files")
+
+
 def patch_wasm_share_links(output_dir, single_notebook=False):
     """Patch the exported WASM notebooks so that 'Create WebAssembly link' works.
 
@@ -1021,6 +1069,9 @@ def main():
     # Step 6: Patch CDN URLs
     single_notebook = len(notebooks) == 1
     patch_cdn_urls(output_dir, pyodide_version, single_notebook=single_notebook)
+
+    # Step 6a-0: Remove 'Publish HTML to web' button
+    patch_publish_button(output_dir)
 
     # Step 6a: Patch WASM share link support
     patch_wasm_share_links(output_dir, single_notebook=single_notebook)
