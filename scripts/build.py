@@ -523,27 +523,28 @@ def patch_wasm_share_links(output_dir):
     #   function X(w){let{code:y,baseUrl:C="https://marimo.app"}=w,
     #     g=new URL(C);return y&&(g.hash=`#code/${...}`),g.href}
     #
-    # Two fixes:
-    #  a) Replace the hardcoded baseUrl default ("https://marimo.app" or
-    #     window.location.href) with the current page URL sans hash, so the
-    #     generated link points to THIS self-hosted site.
-    #  b) When readCode() returns empty (save worker not ready), fall back
-    #     to the <marimo-code> DOM element.
+    # Three fixes:
+    #  a) Replace the hardcoded baseUrl default ("https://marimo.app") with
+    #     the current page URL, so the link points to THIS self-hosted site.
+    #  b) When readCode() returns empty (save worker not ready yet), try the
+    #     URL hash as a fallback (it's updated on every save by marimo's
+    #     urlFileStore.saveFile).  This gives the last-saved version.
+    #  c) If STILL no code available, throw an error so the caller's
+    #     clipboard-copy and "Copied" toast are skipped.  The user sees an
+    #     alert telling them to wait.
     for path in Path(output_dir).rglob("share-*.js"):
         text = path.read_text(errors="ignore")
 
         # (a) Fix baseUrl default to use the current page URL
-        # Matches both: baseUrl:C="https://marimo.app"
-        #           and: baseUrl:C=window.location.href.replace(...)
         text = re.sub(
             r'(baseUrl:\w+=)"https://marimo\.app"',
             r'\1window.location.href.replace(/#.*/,"")',
             text,
         )
 
-        # (b) Inject <marimo-code> fallback before the return statement
-        # Match the share function up to the "return" keyword.
+        # (b)+(c) Inject URL-hash fallback + error before the return stmt.
         # Group 2 captures the minified variable name for "code".
+        # Group 3 captures the LZ-String module alias used for compress.
         share_re = re.compile(
             r'(function \w+\(\w+\)\{let\{code:(\w+),baseUrl:\w+='
             r'[^}]+\}=\w+,\w+=new URL\(\w+\);)'
@@ -552,13 +553,33 @@ def patch_wasm_share_links(output_dir):
         match = share_re.search(text)
         if match:
             code_var = match.group(2)
-            # Insert: if code is falsy, reassign it from <marimo-code>
-            fallback = (
-                f'if(!{code_var}){{'
-                f'var _el=document.querySelector("marimo-code");'
-                f'if(_el){code_var}=decodeURIComponent('
-                f'_el.textContent||"").trim()}}'
+
+            # Find the LZ-String module alias.  The original code uses
+            # (0,E.compressToEncodedURIComponent)(y) — we need the same
+            # alias (E, P, etc.) for decompressFromEncodedURIComponent.
+            lz_match = re.search(
+                r'\(0,(\w+)\.compressToEncodedURIComponent\)',
+                text[match.end():]
             )
+            lz_alias = lz_match.group(1) if lz_match else None
+
+            parts = []
+            # Fallback to URL hash (last saved version)
+            if lz_alias:
+                parts.append(
+                    f'if(!{code_var}){{'
+                    f'var _h=window.location.hash;'
+                    f'if(_h&&_h.indexOf("#code/")===0)'
+                    f'{code_var}=(0,{lz_alias}.decompressFromEncodedURIComponent)'
+                    f'(_h.slice(6))}}'
+                )
+            # If still no code, refuse — don't silently give a broken URL
+            parts.append(
+                f'if(!{code_var}){{throw new Error('
+                f'"Notebook still loading. Please wait and try again.")}}'
+            )
+
+            fallback = ''.join(parts)
             insert_pos = match.end() - len(match.group(3))
             text = text[:insert_pos] + fallback + text[insert_pos:]
             path.write_text(text)
@@ -573,15 +594,24 @@ def patch_wasm_share_links(output_dir):
     # element so that marimo's urlFileStore reads from the hash instead.
     hash_handler_script = """\
     <script data-marimo-share="true">
-    // Handle incoming #code/… share links for self-hosted WASM notebooks.
-    // marimo's file-store checks <marimo-code> before the URL hash, so we
-    // remove the element when a hash is present to let the hash take over.
     (function(){
+      // --- Receiving side: handle incoming #code/… share links ---
+      // marimo's file-store checks <marimo-code> before the URL hash, so
+      // we remove the element when a hash is present to let the hash win.
       var h=window.location.hash;
       if(h&&h.indexOf("#code/")===0){
         var el=document.querySelector("marimo-code");
         if(el)el.remove();
       }
+      // --- Show a user-friendly message when share fails ---
+      // The patched share function throws when code isn't ready yet.
+      // Catch the unhandled rejection and surface it as an alert.
+      window.addEventListener("unhandledrejection",function(ev){
+        if(ev.reason&&/Notebook still loading/.test(ev.reason.message)){
+          ev.preventDefault();
+          alert(ev.reason.message);
+        }
+      });
     })();
     </script>"""
 
