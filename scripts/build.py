@@ -517,18 +517,31 @@ def patch_wasm_share_links(output_dir):
 
     patched = 0
 
-    # --- Part 1: Patch share-*.js to fall back to <marimo-code> ----------
+    # --- Part 1: Patch share-*.js -----------------------------------------
     #
     # The share function looks like (minified):
-    #   function X(w){let{code:y,baseUrl:C=...}=w,g=new URL(C);
-    #     return y&&(g.hash=`#code/${...compress(y)}`),g.href}
+    #   function X(w){let{code:y,baseUrl:C="https://marimo.app"}=w,
+    #     g=new URL(C);return y&&(g.hash=`#code/${...}`),g.href}
     #
-    # When readCode() returns empty (save worker not ready), the code var
-    # is falsy and no #code/ hash is generated.  We inject a fallback that
-    # reads the original code from the <marimo-code> DOM element.
+    # Two fixes:
+    #  a) Replace the hardcoded baseUrl default ("https://marimo.app" or
+    #     window.location.href) with the current page URL sans hash, so the
+    #     generated link points to THIS self-hosted site.
+    #  b) When readCode() returns empty (save worker not ready), fall back
+    #     to the <marimo-code> DOM element.
     for path in Path(output_dir).rglob("share-*.js"):
         text = path.read_text(errors="ignore")
 
+        # (a) Fix baseUrl default to use the current page URL
+        # Matches both: baseUrl:C="https://marimo.app"
+        #           and: baseUrl:C=window.location.href.replace(...)
+        text = re.sub(
+            r'(baseUrl:\w+=)"https://marimo\.app"',
+            r'\1window.location.href.replace(/#.*/,"")',
+            text,
+        )
+
+        # (b) Inject <marimo-code> fallback before the return statement
         # Match the share function up to the "return" keyword.
         # Group 2 captures the minified variable name for "code".
         share_re = re.compile(
