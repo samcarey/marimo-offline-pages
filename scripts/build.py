@@ -549,6 +549,149 @@ def patch_publish_button(output_dir):
     print(f"  ✓ Patched {patched} files")
 
 
+def patch_mode_url_sync(output_dir):
+    """Patch mode-*.js to sync view mode state into the URL.
+
+    When the user toggles between edit and present (app) mode, this patch
+    updates ``?view-as=present`` in the URL via ``history.replaceState``.
+    The share function already reads ``window.location.href``, so the query
+    parameter is automatically included in generated share links.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 6a-1: Syncing view mode → URL")
+    print("══════════════════════════════════════════")
+
+    patched = 0
+    for path in Path(output_dir).rglob("mode-*.js"):
+        text = path.read_text(errors="ignore")
+
+        # Identify the jotai store import variable.
+        # Pattern: import{i as <store>,p as <atom_creator>}from"./useEvent-*.js"
+        store_match = re.search(
+            r'import\{i as (\w+),', text
+        )
+        if not store_match:
+            print(f"  ⚠ WARNING: Could not find store import in {path}")
+            continue
+        store = store_match.group(1)
+
+        # Identify the mode atom variable.
+        # It's the first `const <var>=<atom>({mode:...,"not-set"...cellAnchor` pattern.
+        atom_match = re.search(
+            r'const (\w+)=\w+\(\{mode:', text
+        )
+        if not atom_match:
+            print(f"  ⚠ WARNING: Could not find mode atom in {path}")
+            continue
+        mode_atom = atom_match.group(1)
+
+        # Inject subscription before the final `export{`
+        subscription = (
+            f'{store}.sub({mode_atom},()=>{{var _m={store}.get({mode_atom}).mode;'
+            f'var _u=new URL(window.location.href);'
+            f'if(_m==="present")_u.searchParams.set("view-as","present");'
+            f'else _u.searchParams.delete("view-as");'
+            f'if(_u.href!==window.location.href)history.replaceState(null,"",_u.href)}});'
+        )
+
+        export_match = re.search(r'export\{', text)
+        if not export_match:
+            print(f"  ⚠ WARNING: Could not find export{{ in {path}")
+            continue
+
+        insert_pos = export_match.start()
+        text = text[:insert_pos] + subscription + text[insert_pos:]
+        path.write_text(text)
+        patched += 1
+        print(f"  ✓ Patched mode URL sync: {path}")
+        print(f"    store={store}, modeAtom={mode_atom}")
+
+    if patched == 0:
+        print("  ⚠ WARNING: No mode-*.js files were patched")
+    print(f"  ✓ Patched {patched} files for mode URL sync")
+
+
+def patch_layout_url_sync(output_dir):
+    """Patch layout-*.js to sync layout state ↔ URL.
+
+    Two patches:
+    1. **Read URL on load**: Replace the default ``selectedLayout:"vertical"``
+       with a dynamic read from ``?layout=`` so that shared links open in the
+       correct layout (slides, grid, etc.).
+    2. **Write URL on change**: Subscribe to layout atom changes and update
+       ``?layout=<type>`` in the URL via ``history.replaceState``.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 6a-2: Syncing layout ↔ URL")
+    print("══════════════════════════════════════════")
+
+    patched = 0
+    for path in Path(output_dir).rglob("layout-*.js"):
+        text = path.read_text(errors="ignore")
+
+        # --- 2a: Read ?layout= from URL at initialization ---
+        default_pat = 'selectedLayout:"vertical"'
+        if default_pat in text:
+            text = text.replace(
+                default_pat,
+                'selectedLayout:(new URL(window.location.href).searchParams.get("layout")||"vertical")',
+            )
+            print(f"  ✓ Patched layout default from URL: {path}")
+        else:
+            print(f"  ⚠ WARNING: Could not find selectedLayout:\"vertical\" in {path}")
+            continue
+
+        # --- 2b: Sync layout changes → URL ---
+
+        # Store import (same pattern as mode-*.js)
+        store_match = re.search(r'import\{i as (\w+),', text)
+        if not store_match:
+            print(f"  ⚠ WARNING: Could not find store import in {path}")
+            continue
+        store = store_match.group(1)
+
+        # Promise variable: <var>=Promise.all
+        promise_match = re.search(r'(\w+)=Promise\.all', text)
+        if not promise_match:
+            print(f"  ⚠ WARNING: Could not find Promise.all in {path}")
+            continue
+        promise_var = promise_match.group(1)
+
+        # Layout atom: valueAtom:<var> inside the layout factory
+        layout_atom_match = re.search(r'valueAtom:(\w+)', text)
+        if not layout_atom_match:
+            print(f"  ⚠ WARNING: Could not find valueAtom:<var> in {path}")
+            continue
+        layout_atom = layout_atom_match.group(1)
+
+        # Inject subscription before `export{`
+        subscription = (
+            f'{promise_var}.then(()=>{{{store}.sub({layout_atom},()=>{{'
+            f'var _l={store}.get({layout_atom}).selectedLayout;'
+            f'var _u=new URL(window.location.href);'
+            f'if(_l&&_l!=="vertical")_u.searchParams.set("layout",_l);'
+            f'else _u.searchParams.delete("layout");'
+            f'if(_u.href!==window.location.href)history.replaceState(null,"",_u.href)}})}})'
+            f';'
+        )
+
+        export_match = re.search(r'export\{', text)
+        if not export_match:
+            print(f"  ⚠ WARNING: Could not find export{{ in {path}")
+            continue
+
+        insert_pos = export_match.start()
+        text = text[:insert_pos] + subscription + text[insert_pos:]
+        path.write_text(text)
+        patched += 1
+        print(f"  ✓ Patched layout URL sync: {path}")
+        print(f"    store={store}, promise={promise_var}, layoutAtom={layout_atom}")
+
+    if patched == 0:
+        print("  ⚠ WARNING: No layout-*.js files were patched")
+    print(f"  ✓ Patched {patched} files for layout URL sync")
+
+
 def patch_wasm_share_links(output_dir, single_notebook=False):
     """Patch the exported WASM notebooks so that 'Create WebAssembly link' works.
 
@@ -1074,6 +1217,10 @@ def main():
 
     # Step 6a-0: Remove 'Publish HTML to web' button
     patch_publish_button(output_dir)
+
+    # Step 6a-1/2: Sync view mode and layout to URL for share links
+    patch_mode_url_sync(output_dir)
+    patch_layout_url_sync(output_dir)
 
     # Step 6a: Patch WASM share link support
     patch_wasm_share_links(output_dir, single_notebook=single_notebook)
