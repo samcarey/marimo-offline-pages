@@ -599,6 +599,25 @@ def patch_publish_button(output_dir):
         print(f"  ✓ Patched {patched} files")
 
 
+def _find_jotai_store(text):
+    """Find the jotai store variable in a minified JS chunk.
+
+    The jotai store is imported from a jotai/useEvent module and is the
+    only import with ``.get()`` usage (used to read atom values).
+
+    Returns the variable name, or ``None`` if not found.
+    """
+    # Try imports from jotai-*.js or useEvent-*.js modules
+    for m in re.finditer(
+        r'import\{([^}]+)\}from"\./(?:jotai|useEvent)-[^"]+\.js"', text
+    ):
+        for part in m.group(1).split(","):
+            ident = part.strip().split(" as ")[-1].strip()
+            if ident and re.search(rf'\b{re.escape(ident)}\.get\(', text):
+                return ident
+    return None
+
+
 def patch_mode_url_sync(output_dir):
     """Patch mode-*.js to sync view mode state into the URL.
 
@@ -615,16 +634,17 @@ def patch_mode_url_sync(output_dir):
     for path in Path(output_dir).rglob("mode-*.js"):
         text = path.read_text(errors="ignore")
 
-        # Identify the jotai store import variable.
-        # Pattern: import{i as <store>,p as <atom_creator>}from"./useEvent-*.js"
-        store_match = re.search(
-            r'import\{i as (\w+),', text
-        )
-        if not store_match:
+        # Identify the jotai store variable.  The store is imported from a
+        # jotai-related module and is the only import with a .get() method.
+        #
+        # Known import formats:
+        #   Old:  import{i as <store>,p as <creator>}from"./useEvent-*.js"
+        #   New:  import{d as <creator>,<store>}from"./jotai-*.js"
+        store = _find_jotai_store(text)
+        if not store:
             patch_error("mode-url-sync",
-                        f"Could not find store import in {path}")
+                        f"Could not find jotai store in {path}")
             continue
-        store = store_match.group(1)
 
         # Identify the mode atom variable.
         # It's the first `const <var>=<atom>({mode:...,"not-set"...cellAnchor` pattern.
@@ -698,13 +718,12 @@ def patch_layout_url_sync(output_dir):
 
         # --- 2b: Sync layout changes → URL ---
 
-        # Store import (same pattern as mode-*.js)
-        store_match = re.search(r'import\{i as (\w+),', text)
-        if not store_match:
+        # Store variable (same strategy as mode-*.js)
+        store = _find_jotai_store(text)
+        if not store:
             patch_error("layout-url-sync",
-                        f"Could not find store import in {path}")
+                        f"Could not find jotai store in {path}")
             continue
-        store = store_match.group(1)
 
         # Promise variable: <var>=Promise.all
         promise_match = re.search(r'(\w+)=Promise\.all', text)
