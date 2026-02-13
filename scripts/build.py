@@ -36,7 +36,7 @@ from pathlib import Path
 
 # Pin the marimo version used for exports.  Bump this deliberately after
 # verifying patches still apply (see scripts/check_upgrade.sh).
-MARIMO_VERSION = "0.17.6"
+MARIMO_VERSION = "0.19.11"
 
 GOOGLE_FONTS_CSS_URL = (
     "https://fonts.googleapis.com/css2?"
