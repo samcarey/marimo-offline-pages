@@ -81,8 +81,7 @@ if python "$SCRIPT_DIR/build.py" --mode edit --output-dir "$TMPDIR/site"; then
     echo
     echo "To upgrade:"
     echo "  1. Update MARIMO_VERSION in scripts/build.py to \"$INSTALLED\""
-    echo "  2. Update deploy.yml:  pip install marimo==$INSTALLED"
-    echo "  3. Commit and push"
+    echo "  2. Commit and push (CI files read the version from build.py)"
     exit 0
 else
     echo

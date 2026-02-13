@@ -21,7 +21,8 @@ build:
   stage: build
   image: python:3.12-slim
   script:
-    - pip install marimo==0.17.6  # must match MARIMO_VERSION in scripts/build.py
+    - MARIMO_VERSION=$(python -c "import re; print(re.search(r'MARIMO_VERSION = \"([^\"]+)\"', open('scripts/build.py').read()).group(1))")
+    - pip install "marimo==$MARIMO_VERSION"
     - python scripts/build.py --mode run
   artifacts:
     paths:
