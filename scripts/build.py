@@ -1736,6 +1736,17 @@ _FORBIDDEN_DOMAINS = [
     "wasm.marimo.app",
 ]
 
+# CDN URL substrings that are known-safe to leave in place.
+# These are optional features that degrade gracefully when offline.
+_ALLOWED_CDN_URLS = [
+    # MathJax: checked conditionally (`oN("url")==="ready"`), not actively
+    # loaded.  marimo uses KaTeX (bundled) for math rendering.
+    "cdn.jsdelivr.net/npm/mathjax-full@",
+    # Lucide icons: fetches SVGs for the icon picker in edit mode.
+    # Fails silently — icons just don't render in the autocomplete.
+    "cdn.jsdelivr.net/npm/lucide-static@",
+]
+
 # Markers that MUST be present in the output after patching.
 _REQUIRED_MARKERS = [
     # (glob, substring, description)
@@ -1774,18 +1785,21 @@ def verify_build(output_dir):
         except Exception:
             continue
         for domain in _FORBIDDEN_DOMAINS:
-            # Ignore 'baseUrl:...' lines — those were rewritten to
-            # window.location.href which is fine, but the old default
-            # ("https://marimo.app") may still appear in comments.
-            # Match only actual URLs: https://domain
             pattern = f"https://{domain}"
-            if pattern in text:
-                # Find the offending line for diagnostics
-                for i, line in enumerate(text.splitlines(), 1):
-                    if pattern in line:
-                        snippet = line.strip()[:120]
-                        violations.append((path, domain, i, snippet))
-                        break
+            if pattern not in text:
+                continue
+            # Check each occurrence against the allowlist
+            for url_m in re.finditer(
+                rf'https://{re.escape(domain)}[^\s"\'`\\)]*', text
+            ):
+                url = url_m.group()
+                if any(allowed in url for allowed in _ALLOWED_CDN_URLS):
+                    continue  # known-safe, skip
+                # Find the line number for diagnostics
+                lineno = text[:url_m.start()].count("\n") + 1
+                line = text.splitlines()[lineno - 1].strip()[:120]
+                violations.append((path, domain, lineno, line))
+                break  # one violation per domain per file is enough
 
     if violations:
         for path, domain, lineno, snippet in violations:
