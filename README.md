@@ -55,13 +55,48 @@ The build script (`scripts/build.py`) does the following:
 
 ## Adding Python packages
 
-The Pyodide "full" distribution includes many common packages. If your notebook
-needs a package not included:
+The Pyodide "full" distribution includes many common packages (numpy, pandas,
+scipy, etc.). For additional **pure-Python** packages, add them to
+`requirements-wasm-extras.in`:
 
-1. Check if it's in the [Pyodide package list](https://pyodide.org/en/stable/usage/packages-in-pyodide.html)
-2. If it's a pure-Python package, download its `.whl` from PyPI
-3. Place the wheel in `_site/pyodide/` (or automate in the build script)
-4. Update `pyodide-lock.json` with the package entry
+```
+# requirements-wasm-extras.in
+Markdown
+pymdown-extensions
+humanize
+my-package>=1.0
+```
+
+The build script automatically downloads each package and its transitive
+dependencies, registers them in `pyodide-lock.json`, and bundles the wheels in
+the static site. Only `py3-none-any` wheels are supported.
+
+## Upgrading marimo
+
+The marimo version is pinned in `scripts/build.py` (`MARIMO_VERSION`). CI files
+read from there automatically — there is only one place to update.
+
+To test a new version before committing:
+
+```bash
+# Test against a specific version
+scripts/check_upgrade.sh 0.18.0
+
+# Or test against the latest release
+scripts/check_upgrade.sh
+```
+
+This creates a temporary virtualenv, installs the target version, runs the full
+build with all patches, and reports pass/fail without deploying anything.
+
+If it passes:
+
+1. Update `MARIMO_VERSION` in `scripts/build.py`
+2. Commit and push
+
+If it fails, the output shows exactly which patches broke (e.g. a renamed JS
+chunk or changed minified variable). Fix the regexes in the relevant
+`patch_*()` function, then re-run the check.
 
 ## Deploying to GitLab
 
@@ -86,16 +121,19 @@ still works but uses a slower fallback mode.
 ## Project structure
 
 ```
-├── CLAUDE.md               # AI-readable project spec
-├── README.md               # This file
+├── CLAUDE.md                    # AI-readable project spec
+├── README.md                    # This file
+├── requirements-wasm-extras.in  # Extra Python packages to bundle
+├── pip.conf                     # pip proxy/index config (placeholder)
 ├── notebooks/
-│   └── example.py          # marimo notebooks
-├── public/                  # Data files for notebooks
+│   └── example.py               # marimo notebooks
+├── public/                      # Data files for notebooks
 ├── scripts/
-│   └── build.py            # Build script (downloads + patches everything)
+│   ├── build.py                 # Build script (downloads + patches everything)
+│   └── check_upgrade.sh         # Test marimo version compatibility
 ├── .github/workflows/
-│   └── deploy.yml          # GitHub Pages CI
-└── .gitlab-ci.yml          # GitLab Pages CI
+│   └── deploy.yml               # GitHub Pages CI
+└── .gitlab-ci.yml               # GitLab Pages CI
 ```
 
 ## Limitations
