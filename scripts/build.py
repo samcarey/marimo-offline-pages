@@ -34,6 +34,10 @@ from pathlib import Path
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Pin the marimo version used for exports.  Bump this deliberately after
+# verifying patches still apply (see scripts/check_upgrade.sh).
+MARIMO_VERSION = "0.17.6"
+
 GOOGLE_FONTS_CSS_URL = (
     "https://fonts.googleapis.com/css2?"
     "family=Fira+Mono:wght@400;500;700&"
@@ -47,6 +51,40 @@ WOFF2_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+
+# ---------------------------------------------------------------------------
+# Patch-error tracking
+# ---------------------------------------------------------------------------
+# Every patch function records failures here instead of printing warnings.
+# After all patches run, check_patch_errors() aborts the build with a
+# summary if anything failed — no more silent breakage.
+
+_patch_errors: list[tuple[str, str]] = []
+
+
+def patch_error(step: str, message: str):
+    """Record a patch failure.  Build will abort after all patches run."""
+    _patch_errors.append((step, message))
+    print(f"  ✗ PATCH FAILED: {message}")
+
+
+def check_patch_errors():
+    """Abort the build if any patches failed to apply."""
+    if not _patch_errors:
+        return
+    print("\n" + "=" * 60)
+    print("BUILD FAILED — the following patches did not apply:")
+    print("=" * 60)
+    for step, msg in _patch_errors:
+        print(f"  [{step}] {msg}")
+    print()
+    print("This usually means marimo's output format has changed.")
+    print("Check the new marimo version's exported JS for renamed")
+    print("chunks, changed variable names, or restructured code.")
+    print()
+    print("To diagnose, run:  scripts/check_upgrade.sh [new-version]")
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +538,10 @@ def patch_cdn_urls(output_dir, pyodide_version, single_notebook=False):
             patched_count += 1
             print(f"  ✓ Patched: {path}")
 
-    print(f"  ✓ Patched {patched_count} files total")
+    if patched_count == 0:
+        patch_error("cdn-urls", "No files were patched for CDN URL rewriting")
+    else:
+        print(f"  ✓ Patched {patched_count} files total")
 
 
 def patch_publish_button(output_dir):
@@ -532,7 +573,8 @@ def patch_publish_button(output_dir):
             patched += 1
             print(f"  ✓ Removed publish button: {path}")
         else:
-            print(f"  ⚠ 'Publish HTML to web' pattern not found in {path}")
+            patch_error("publish-button",
+                        f"'Publish HTML to web' regex did not match in {path}")
 
     if patched == 0:
         # Try broader search in case the chunk name changed
@@ -550,7 +592,11 @@ def patch_publish_button(output_dir):
                 patched += 1
                 print(f"  ✓ Removed publish button: {path}")
 
-    print(f"  ✓ Patched {patched} files")
+    if patched == 0:
+        patch_error("publish-button",
+                    "No files contained the 'Publish HTML to web' pattern")
+    else:
+        print(f"  ✓ Patched {patched} files")
 
 
 def patch_mode_url_sync(output_dir):
@@ -575,7 +621,8 @@ def patch_mode_url_sync(output_dir):
             r'import\{i as (\w+),', text
         )
         if not store_match:
-            print(f"  ⚠ WARNING: Could not find store import in {path}")
+            patch_error("mode-url-sync",
+                        f"Could not find store import in {path}")
             continue
         store = store_match.group(1)
 
@@ -585,7 +632,8 @@ def patch_mode_url_sync(output_dir):
             r'const (\w+)=\w+\(\{mode:', text
         )
         if not atom_match:
-            print(f"  ⚠ WARNING: Could not find mode atom in {path}")
+            patch_error("mode-url-sync",
+                        f"Could not find mode atom in {path}")
             continue
         mode_atom = atom_match.group(1)
 
@@ -600,7 +648,8 @@ def patch_mode_url_sync(output_dir):
 
         export_match = re.search(r'export\{', text)
         if not export_match:
-            print(f"  ⚠ WARNING: Could not find export{{ in {path}")
+            patch_error("mode-url-sync",
+                        f"Could not find export{{ in {path}")
             continue
 
         insert_pos = export_match.start()
@@ -611,8 +660,9 @@ def patch_mode_url_sync(output_dir):
         print(f"    store={store}, modeAtom={mode_atom}")
 
     if patched == 0:
-        print("  ⚠ WARNING: No mode-*.js files were patched")
-    print(f"  ✓ Patched {patched} files for mode URL sync")
+        patch_error("mode-url-sync", "No mode-*.js files were patched")
+    else:
+        print(f"  ✓ Patched {patched} files for mode URL sync")
 
 
 def patch_layout_url_sync(output_dir):
@@ -642,7 +692,8 @@ def patch_layout_url_sync(output_dir):
             )
             print(f"  ✓ Patched layout default from URL: {path}")
         else:
-            print(f"  ⚠ WARNING: Could not find selectedLayout:\"vertical\" in {path}")
+            patch_error("layout-url-sync",
+                        f'Could not find selectedLayout:"vertical" in {path}')
             continue
 
         # --- 2b: Sync layout changes → URL ---
@@ -650,21 +701,24 @@ def patch_layout_url_sync(output_dir):
         # Store import (same pattern as mode-*.js)
         store_match = re.search(r'import\{i as (\w+),', text)
         if not store_match:
-            print(f"  ⚠ WARNING: Could not find store import in {path}")
+            patch_error("layout-url-sync",
+                        f"Could not find store import in {path}")
             continue
         store = store_match.group(1)
 
         # Promise variable: <var>=Promise.all
         promise_match = re.search(r'(\w+)=Promise\.all', text)
         if not promise_match:
-            print(f"  ⚠ WARNING: Could not find Promise.all in {path}")
+            patch_error("layout-url-sync",
+                        f"Could not find Promise.all in {path}")
             continue
         promise_var = promise_match.group(1)
 
         # Layout atom: valueAtom:<var> inside the layout factory
         layout_atom_match = re.search(r'valueAtom:(\w+)', text)
         if not layout_atom_match:
-            print(f"  ⚠ WARNING: Could not find valueAtom:<var> in {path}")
+            patch_error("layout-url-sync",
+                        f"Could not find valueAtom:<var> in {path}")
             continue
         layout_atom = layout_atom_match.group(1)
 
@@ -681,7 +735,8 @@ def patch_layout_url_sync(output_dir):
 
         export_match = re.search(r'export\{', text)
         if not export_match:
-            print(f"  ⚠ WARNING: Could not find export{{ in {path}")
+            patch_error("layout-url-sync",
+                        f"Could not find export{{ in {path}")
             continue
 
         insert_pos = export_match.start()
@@ -692,8 +747,9 @@ def patch_layout_url_sync(output_dir):
         print(f"    store={store}, promise={promise_var}, layoutAtom={layout_atom}")
 
     if patched == 0:
-        print("  ⚠ WARNING: No layout-*.js files were patched")
-    print(f"  ✓ Patched {patched} files for layout URL sync")
+        patch_error("layout-url-sync", "No layout-*.js files were patched")
+    else:
+        print(f"  ✓ Patched {patched} files for layout URL sync")
 
 
 def patch_wasm_share_links(output_dir, single_notebook=False):
@@ -799,7 +855,8 @@ def patch_wasm_share_links(output_dir, single_notebook=False):
             patched += 1
             print(f"  ✓ Patched share function: {path}")
         else:
-            print(f"  ⚠ Could not find share function pattern in {path}")
+            patch_error("share-links",
+                        f"Could not find share function pattern in {path}")
 
     # --- Part 2: Inject URL-hash handler into each notebook index.html ---
     #
@@ -863,9 +920,14 @@ def patch_wasm_share_links(output_dir, single_notebook=False):
             patched += 1
             print(f"  ✓ Injected URL-hash handler: {path}")
         else:
-            print(f"  ⚠ Could not find </marimo-code> in {path}")
+            patch_error("share-links",
+                        f"Could not find </marimo-code> in {path}")
 
-    print(f"  ✓ Patched {patched} files for share-link support")
+    if patched == 0:
+        patch_error("share-links",
+                    "No files were patched for share-link support")
+    else:
+        print(f"  ✓ Patched {patched} files for share-link support")
 
 
 def patch_share_layout_embed(output_dir):
@@ -901,7 +963,8 @@ def patch_share_layout_embed(output_dir):
         # Find .serializeLayout( — unique to getSerializedLayout()
         ser_idx = text.find('.serializeLayout(')
         if ser_idx == -1:
-            print(f"  ⚠ WARNING: Could not find .serializeLayout( in {path}")
+            patch_error("layout-embed",
+                        f"Could not find .serializeLayout( in {path}")
             continue
 
         # Find the enclosing function.  In minified builds this is either:
@@ -916,8 +979,9 @@ def patch_share_layout_embed(output_dir):
                 r'function (\w+)\(\)\{', text[:ser_idx]
             ))
         if not fn_matches:
-            print(f"  ⚠ WARNING: Could not find enclosing function "
-                  f"for serializeLayout in {path}")
+            patch_error("layout-embed",
+                        f"Could not find enclosing function "
+                        f"for serializeLayout in {path}")
             continue
         fn_name = fn_matches[-1].group(1)
 
@@ -928,7 +992,8 @@ def patch_share_layout_embed(output_dir):
         # actually clicks Share, by which time the TLA has resolved.
         export_match = re.search(r'export\{', text)
         if not export_match:
-            print(f"  ⚠ WARNING: Could not find export{{ in {path}")
+            patch_error("layout-embed",
+                        f"Could not find export{{ in {path}")
             continue
         insert_pos = export_match.start()
         text = (text[:insert_pos]
@@ -949,7 +1014,8 @@ def patch_share_layout_embed(output_dir):
             text,
         )
         if not var_match:
-            print(f"  ⚠ WARNING: Could not find error-throw pattern in {path}")
+            patch_error("layout-embed",
+                        f"Could not find error-throw pattern in {path}")
             continue
         code_var = var_match.group(1)
 
@@ -958,7 +1024,8 @@ def patch_share_layout_embed(output_dir):
                   'Please wait and try again.")}')
         anchor_idx = text.find(anchor)
         if anchor_idx == -1:
-            print(f"  ⚠ WARNING: Could not find error anchor in {path}")
+            patch_error("layout-embed",
+                        f"Could not find error anchor in {path}")
             continue
         insert_pos = anchor_idx + len(anchor)
 
@@ -1027,10 +1094,11 @@ def download_marimo_base(output_dir, marimo_version):
                         print(f"  ✓ Downloaded: {f.name}")
                         break
                 else:
-                    print(f"  ⚠ Could not download marimo-base: {result.stderr}")
+                    patch_error("marimo-base",
+                                f"pip download failed: {result.stderr.strip()}")
                     return
         except Exception as e:
-            print(f"  ⚠ Could not download marimo-base: {e}")
+            patch_error("marimo-base", f"Could not download marimo-base: {e}")
             return
 
     # Update pyodide-lock.json to include marimo-base
@@ -1058,7 +1126,8 @@ def download_marimo_base(output_dir, marimo_version):
                 pyodide_lock.write_text(json.dumps(lock_data, indent=2))
                 print(f"  ✓ Updated pyodide-lock.json with marimo-base")
         except Exception as e:
-            print(f"  ⚠ Could not update pyodide-lock.json: {e}")
+            patch_error("marimo-base",
+                        f"Could not update pyodide-lock.json: {e}")
 
 
 def _get_pip_env():
@@ -1637,8 +1706,172 @@ def add_metadata_files(output_dir):
 
 
 # ---------------------------------------------------------------------------
+# Post-patch verification
+# ---------------------------------------------------------------------------
+
+# Domains that must NOT appear in any non-vendor file after patching.
+_FORBIDDEN_DOMAINS = [
+    "cdn.jsdelivr.net",
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+    "wasm.marimo.app",
+]
+
+# Markers that MUST be present in the output after patching.
+_REQUIRED_MARKERS = [
+    # (glob, substring, description)
+    ("**/share-*.js", "Notebook still loading", "share-link error fallback"),
+    ("**/share-*.js", "__marimoGetSerializedLayout", "layout embed in share"),
+    ("**/layout-*.js", "__marimoGetSerializedLayout", "layout global exposure"),
+    ("**/mode-*.js", "view-as", "mode URL sync"),
+    ("**/layout-*.js", "searchParams", "layout URL sync"),
+    ("**/index.html", 'data-marimo-share', "share-link hash handler"),
+]
+
+
+def verify_build(output_dir):
+    """Scan the built site for leftover CDN URLs and missing patch markers.
+
+    Any problem is recorded via ``patch_error`` so the build fails with a
+    clear summary.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Verifying build output")
+    print("══════════════════════════════════════════")
+
+    output = Path(output_dir)
+
+    # --- Check for forbidden external domains ---
+    violations = []
+    for path in output.rglob("*"):
+        if path.suffix not in (".js", ".html", ".mjs", ".css"):
+            continue
+        # Skip vendor/pyodide/fonts directories (we don't patch those)
+        rel = str(path.relative_to(output))
+        if any(rel.startswith(d) for d in ("pyodide/", "vendor/", "fonts/")):
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except Exception:
+            continue
+        for domain in _FORBIDDEN_DOMAINS:
+            # Ignore 'baseUrl:...' lines — those were rewritten to
+            # window.location.href which is fine, but the old default
+            # ("https://marimo.app") may still appear in comments.
+            # Match only actual URLs: https://domain
+            pattern = f"https://{domain}"
+            if pattern in text:
+                # Find the offending line for diagnostics
+                for i, line in enumerate(text.splitlines(), 1):
+                    if pattern in line:
+                        snippet = line.strip()[:120]
+                        violations.append((path, domain, i, snippet))
+                        break
+
+    if violations:
+        for path, domain, lineno, snippet in violations:
+            patch_error("verify-cdn",
+                        f"Leftover CDN URL ({domain}) in "
+                        f"{path}:{lineno}: {snippet}")
+    else:
+        print(f"  ✓ No forbidden CDN domains found")
+
+    # --- Check for https://marimo.app as a hardcoded default ---
+    for path in output.rglob("**/share-*.js"):
+        try:
+            text = path.read_text(errors="ignore")
+        except Exception:
+            continue
+        if '"https://marimo.app"' in text:
+            patch_error("verify-cdn",
+                        f"Hardcoded marimo.app URL still in {path}")
+
+    # --- Check required patch markers ---
+    for glob_pat, marker, desc in _REQUIRED_MARKERS:
+        found = False
+        matched_files = list(output.rglob(glob_pat))
+        if not matched_files:
+            patch_error("verify-markers",
+                        f"No files matching {glob_pat} — cannot verify {desc}")
+            continue
+        for path in matched_files:
+            try:
+                text = path.read_text(errors="ignore")
+            except Exception:
+                continue
+            if marker in text:
+                found = True
+                break
+        if found:
+            print(f"  ✓ Found: {desc}")
+        else:
+            patch_error("verify-markers",
+                        f"Missing marker for '{desc}' "
+                        f"(expected '{marker}' in {glob_pat})")
+
+    # --- Check publish button is hidden ---
+    for path in output.rglob("*.js"):
+        try:
+            text = path.read_text(errors="ignore")
+        except Exception:
+            continue
+        if "Publish HTML to web" in text:
+            m = re.search(
+                r'label:"Publish HTML to web",hidden:([^,]+)', text
+            )
+            if m and m.group(1) != "!0":
+                patch_error("verify-publish",
+                            f"Publish button not hidden in {path} "
+                            f"(hidden:{m.group(1)})")
+            elif m:
+                print(f"  ✓ Publish button hidden")
+
+    # --- Check pyodide-lock.json has required extra packages ---
+    lock_path = output / "pyodide" / "pyodide-lock.json"
+    if lock_path.exists():
+        lock_data = json.loads(lock_path.read_text())
+        packages = lock_data.get("packages", {})
+        req_file = Path("requirements-wasm-extras.in")
+        if req_file.exists():
+            for line in parse_requirements_in(req_file):
+                if line.startswith("git+"):
+                    continue  # can't easily check these by name
+                from packaging.requirements import Requirement
+                try:
+                    req = Requirement(line)
+                    pkg_key = _pyodide_normalize(req.name)
+                    if pkg_key not in packages:
+                        patch_error("verify-packages",
+                                    f"Package '{req.name}' ({pkg_key}) "
+                                    f"not in pyodide-lock.json")
+                    else:
+                        print(f"  ✓ Package: {pkg_key}")
+                except Exception:
+                    pass
+    else:
+        patch_error("verify-packages", "pyodide-lock.json not found")
+
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def _detect_marimo_version():
+    """Return the installed marimo version, or MARIMO_VERSION as fallback."""
+    for python in ("python3", "python"):
+        try:
+            result = subprocess.run(
+                [python, "-c", "import marimo; print(marimo.__version__)"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except FileNotFoundError:
+            continue
+    return MARIMO_VERSION
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1663,6 +1896,15 @@ def main():
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
+
+    # Verify installed marimo matches the pinned version
+    marimo_version = _detect_marimo_version()
+    if marimo_version != MARIMO_VERSION:
+        print(f"\n⚠ WARNING: Installed marimo {marimo_version} differs from "
+              f"pinned MARIMO_VERSION {MARIMO_VERSION}")
+        print(f"  Patches were tested against {MARIMO_VERSION}.")
+        print(f"  If the build fails, update patches or revert marimo.")
+        print()
 
     # Clean output directory
     if output_dir.exists():
@@ -1704,15 +1946,10 @@ def main():
     # Step 6a-3: Embed layout positions in share link code
     patch_share_layout_embed(output_dir)
 
+    # Check patch errors before proceeding to downloads (fail fast)
+    check_patch_errors()
+
     # Step 6b: Download marimo-base for WASM support
-    try:
-        result = subprocess.run(
-            ["python", "-c", "import marimo; print(marimo.__version__)"],
-            capture_output=True, text=True
-        )
-        marimo_version = result.stdout.strip() if result.returncode == 0 else "0.19.7"
-    except Exception:
-        marimo_version = "0.19.7"  # fallback
     download_marimo_base(output_dir, marimo_version)
 
     # Step 6c: Download extra packages from requirements-wasm-extras.in
@@ -1727,6 +1964,10 @@ def main():
     # Step 9: Metadata files
     add_metadata_files(output_dir)
 
+    # Step 10: Verify the build
+    verify_build(output_dir)
+    check_patch_errors()
+
     # Summary
     site_size = sum(
         f.stat().st_size for f in output_dir.rglob("*") if f.is_file()
@@ -1737,6 +1978,7 @@ def main():
     print(f"  Output: {output_dir}/")
     print(f"  Size:   {site_size / (1024*1024):.1f} MB")
     print(f"  Pyodide version: {pyodide_version}")
+    print(f"  marimo version:  {marimo_version} (pinned: {MARIMO_VERSION})")
     print(f"  Notebooks: {len(notebooks)}")
     print()
     print("  To test locally:")

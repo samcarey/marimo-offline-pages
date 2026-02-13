@@ -27,8 +27,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install marimo
-          # Add any other build-time dependencies here
+          pip install marimo==0.17.6
+          # Pin version ↑ — must match MARIMO_VERSION in scripts/build.py
+          # Run scripts/check_upgrade.sh <new-version> before bumping
 
       - name: Build offline site
         run: python scripts/build.py --mode edit
