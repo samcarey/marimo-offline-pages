@@ -539,7 +539,37 @@ def patch_cdn_urls(output_dir, pyodide_version, single_notebook=False):
             print(f"  ✓ Patched: {path}")
 
     if patched_count == 0:
-        patch_error("cdn-urls", "No files were patched for CDN URL rewriting")
+        # marimo may already use relative paths (no CDN URLs to replace).
+        # Verify that no forbidden CDN domains remain — if clean, that's fine.
+        has_cdn = False
+        for path in Path(output_dir).rglob("*"):
+            if path.suffix not in (".js", ".html", ".mjs", ".css"):
+                continue
+            if any(d in str(path) for d in ("pyodide/", "vendor/", "fonts/")):
+                continue
+            try:
+                text = path.read_text(errors="ignore")
+            except Exception:
+                continue
+            for domain in _FORBIDDEN_DOMAINS:
+                pat = f"https://{domain}"
+                if pat not in text:
+                    continue
+                for url_m in re.finditer(
+                    rf'https://{re.escape(domain)}[^\s"\'`\\)]*', text
+                ):
+                    if not any(a in url_m.group() for a in _ALLOWED_CDN_URLS):
+                        has_cdn = True
+                        break
+                if has_cdn:
+                    break
+            if has_cdn:
+                break
+        if has_cdn:
+            patch_error("cdn-urls", "No files were patched for CDN URL "
+                        "rewriting but forbidden CDN URLs remain")
+        else:
+            print("  ✓ No CDN URLs to patch (marimo already uses relative paths)")
     else:
         print(f"  ✓ Patched {patched_count} files total")
 
@@ -556,6 +586,7 @@ def patch_publish_button(output_dir):
     print("══════════════════════════════════════════")
 
     patched = 0
+    already_hidden = 0
     for path in Path(output_dir).rglob("useNotebookActions-*.js"):
         text = path.read_text(errors="ignore")
         # In the minified JS the menu item looks like:
@@ -572,15 +603,23 @@ def patch_publish_button(output_dir):
             path.write_text(new_text)
             patched += 1
             print(f"  ✓ Removed publish button: {path}")
-        else:
+        elif 'label:"Publish HTML to web",hidden:!0' in text:
+            already_hidden += 1
+            print(f"  ✓ Publish button already hidden: {path}")
+        elif "Publish HTML to web" in text:
             patch_error("publish-button",
-                        f"'Publish HTML to web' regex did not match in {path}")
+                        f"'Publish HTML to web' found but hidden regex "
+                        f"did not match in {path}")
 
-    if patched == 0:
+    if patched == 0 and already_hidden == 0:
         # Try broader search in case the chunk name changed
         for path in Path(output_dir).rglob("*.js"):
             text = path.read_text(errors="ignore")
             if "Publish HTML to web" not in text:
+                continue
+            if 'label:"Publish HTML to web",hidden:!0' in text:
+                already_hidden += 1
+                print(f"  ✓ Publish button already hidden: {path}")
                 continue
             new_text = re.sub(
                 r'(label:"Publish HTML to web",hidden:)[^,]+',
@@ -592,10 +631,10 @@ def patch_publish_button(output_dir):
                 patched += 1
                 print(f"  ✓ Removed publish button: {path}")
 
-    if patched == 0:
+    if patched == 0 and already_hidden == 0:
         patch_error("publish-button",
                     "No files contained the 'Publish HTML to web' pattern")
-    else:
+    elif patched > 0:
         print(f"  ✓ Patched {patched} files")
 
 
@@ -631,8 +670,16 @@ def patch_mode_url_sync(output_dir):
     print("══════════════════════════════════════════")
 
     patched = 0
+    already_synced = 0
     for path in Path(output_dir).rglob("mode-*.js"):
         text = path.read_text(errors="ignore")
+
+        # Check if mode URL sync is already present (marimo may add it natively)
+        if ('searchParams.set("view-as"' in text
+                and 'searchParams.delete("view-as")' in text):
+            already_synced += 1
+            print(f"  ✓ Mode URL sync already present: {path}")
+            continue
 
         # Identify the jotai store variable.  The store is imported from a
         # jotai-related module and is the only import with a .get() method.
@@ -679,9 +726,9 @@ def patch_mode_url_sync(output_dir):
         print(f"  ✓ Patched mode URL sync: {path}")
         print(f"    store={store}, modeAtom={mode_atom}")
 
-    if patched == 0:
+    if patched == 0 and already_synced == 0:
         patch_error("mode-url-sync", "No mode-*.js files were patched")
-    else:
+    elif patched > 0:
         print(f"  ✓ Patched {patched} files for mode URL sync")
 
 
@@ -700,8 +747,17 @@ def patch_layout_url_sync(output_dir):
     print("══════════════════════════════════════════")
 
     patched = 0
+    already_synced = 0
     for path in Path(output_dir).rglob("layout-*.js"):
         text = path.read_text(errors="ignore")
+
+        # Check if layout URL sync is already present (marimo >= 0.19)
+        has_url_read = 'searchParams.get("layout")' in text
+        has_url_write = 'searchParams.set("layout"' in text
+        if has_url_read and has_url_write:
+            already_synced += 1
+            print(f"  ✓ Layout URL sync already present: {path}")
+            continue
 
         # --- 2a: Read ?layout= from URL at initialization ---
         default_pat = 'selectedLayout:"vertical"'
@@ -711,12 +767,17 @@ def patch_layout_url_sync(output_dir):
                 'selectedLayout:(new URL(window.location.href).searchParams.get("layout")||"vertical")',
             )
             print(f"  ✓ Patched layout default from URL: {path}")
-        else:
+        elif not has_url_read:
             patch_error("layout-url-sync",
                         f'Could not find selectedLayout:"vertical" in {path}')
             continue
 
         # --- 2b: Sync layout changes → URL ---
+        if has_url_write:
+            # Write sync already present, just need the read patch above
+            path.write_text(text)
+            patched += 1
+            continue
 
         # Store variable (same strategy as mode-*.js)
         store = _find_jotai_store(text)
@@ -765,9 +826,9 @@ def patch_layout_url_sync(output_dir):
         print(f"  ✓ Patched layout URL sync: {path}")
         print(f"    store={store}, promise={promise_var}, layoutAtom={layout_atom}")
 
-    if patched == 0:
+    if patched == 0 and already_synced == 0:
         patch_error("layout-url-sync", "No layout-*.js files were patched")
-    else:
+    elif patched > 0:
         print(f"  ✓ Patched {patched} files for layout URL sync")
 
 
@@ -812,6 +873,20 @@ def patch_wasm_share_links(output_dir, single_notebook=False):
     for path in Path(output_dir).rglob("share-*.js"):
         text = path.read_text(errors="ignore")
 
+        # Check if all desired behaviors already exist (marimo >= 0.19)
+        has_self_hosted_url = (
+            '"https://marimo.app"' not in text
+            and 'window.location.href' in text
+        )
+        has_hash_fallback = 'decompressFromEncodedURIComponent' in text
+        has_dom_fallback = 'querySelector("marimo-code")' in text
+        has_error_throw = 'Notebook still loading' in text
+
+        if has_self_hosted_url and has_hash_fallback and has_dom_fallback and has_error_throw:
+            patched += 1
+            print(f"  ✓ Share function already has all fallbacks: {path}")
+            continue
+
         # (a) Fix baseUrl default to use the current page URL
         text = re.sub(
             r'(baseUrl:\w+=)"https://marimo\.app"',
@@ -851,11 +926,6 @@ def patch_wasm_share_links(output_dir, single_notebook=False):
                     f'(_h.slice(6))}}'
                 )
             # Fallback to <marimo-code> DOM element (original notebook code).
-            # On first load before any save, the URL hash is empty and the
-            # save worker hasn't initialised yet, but <marimo-code> always
-            # has the notebook code (URL-encoded).  decodeURIComponent gives
-            # us the raw Python source, which the share function then
-            # compresses into the #code/… hash fragment.
             parts.append(
                 f'if(!{code_var}){{'
                 f'var _el=document.querySelector("marimo-code");'
@@ -925,8 +995,10 @@ def patch_wasm_share_links(output_dir, single_notebook=False):
 
         text = path.read_text(errors="ignore")
 
-        # Already patched?
+        # Already patched (or included natively by marimo)?
         if 'data-marimo-share' in text:
+            patched += 1
+            print(f"  ✓ URL-hash handler already present: {path}")
             continue
 
         # Insert AFTER </marimo-code> — the element must already be in the
@@ -979,6 +1051,11 @@ def patch_share_layout_embed(output_dir):
     for path in Path(output_dir).rglob("layout-*.js"):
         text = path.read_text(errors="ignore")
 
+        # Already exposed?
+        if '__marimoGetSerializedLayout' in text:
+            print(f"  ✓ getSerializedLayout already exposed: {path}")
+            continue
+
         # Find .serializeLayout( — unique to getSerializedLayout()
         ser_idx = text.find('.serializeLayout(')
         if ser_idx == -1:
@@ -1026,8 +1103,13 @@ def patch_share_layout_embed(output_dir):
     for path in Path(output_dir).rglob("share-*.js"):
         text = path.read_text(errors="ignore")
 
+        # Already has layout embedding?
+        if '__marimoGetSerializedLayout' in text:
+            print(f"  ✓ Layout embedding already present: {path}")
+            continue
+
         # Find the code variable from the error-throw pattern injected by
-        # patch_wasm_share_links.
+        # patch_wasm_share_links (or present natively in newer marimo).
         var_match = re.search(
             r'if\(!(\w+)\)\{throw new Error\("Notebook still loading',
             text,
