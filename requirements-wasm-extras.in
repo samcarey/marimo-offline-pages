@@ -1,0 +1,16 @@
+# Extra pure-Python packages for offline WASM notebooks.
+# These are downloaded at build time and available to notebooks at runtime.
+# Only pure-Python wheels (py3-none-any) are supported.
+# Packages already bundled in Pyodide (numpy, pandas, etc.) are skipped automatically.
+#
+# Supported formats:
+#   package-name
+#   package-name>=1.0
+#   package-name==1.2.3
+#   git+https://gitlab.example.com/team/repo.git@v1.0
+#
+Markdown
+pymdown-extensions
+tomlkit
+itsdangerous
+narwhals>=2.0

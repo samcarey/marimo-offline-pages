@@ -11,8 +11,10 @@ Usage:
 """
 
 import argparse
+import configparser
 import glob
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -21,8 +23,10 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.request
 import urllib.error
+import zipfile
 from pathlib import Path
 
 
@@ -1057,119 +1061,475 @@ def download_marimo_base(output_dir, marimo_version):
             print(f"  ⚠ Could not update pyodide-lock.json: {e}")
 
 
-def download_extra_package(output_dir, package_name, imports=None, min_version=None):
-    """Download an extra pure-Python package from PyPI and add to pyodide-lock.json.
+def _get_pip_env():
+    """Return an environment dict with PIP_CONFIG_FILE set if pip.conf exists."""
+    env = os.environ.copy()
+    pip_conf = Path("pip.conf")
+    if pip_conf.exists():
+        env["PIP_CONFIG_FILE"] = str(pip_conf.resolve())
+    return env
 
-    If the package exists in Pyodide but is older than min_version, it will be upgraded.
+
+def _get_pypi_index_url():
+    """Read a custom index-url from pip.conf, falling back to pypi.org."""
+    pip_conf = Path("pip.conf")
+    if pip_conf.exists():
+        cfg = configparser.ConfigParser()
+        cfg.read(pip_conf)
+        url = cfg.get("global", "index-url", fallback=None)
+        if url:
+            return url.rstrip("/")
+    return "https://pypi.org"
+
+
+def _get_pypi_proxy_handler():
+    """Return a urllib ProxyHandler if pip.conf specifies a proxy."""
+    pip_conf = Path("pip.conf")
+    if pip_conf.exists():
+        cfg = configparser.ConfigParser()
+        cfg.read(pip_conf)
+        proxy = cfg.get("global", "proxy", fallback=None)
+        if proxy:
+            return urllib.request.ProxyHandler(
+                {"http": proxy, "https": proxy}
+            )
+    return None
+
+
+def _pypi_urlopen(url, timeout=30):
+    """Open a URL using any proxy configured in pip.conf."""
+    req = urllib.request.Request(url)
+    handler = _get_pypi_proxy_handler()
+    if handler:
+        opener = urllib.request.build_opener(handler)
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _pyodide_marker_env():
+    """Return a PEP 508 marker environment matching Pyodide's runtime."""
+    return {
+        "os_name": "posix",
+        "sys_platform": "emscripten",
+        "platform_system": "Emscripten",
+        "platform_machine": "wasm32",
+        "platform_release": "",
+        "implementation_name": "cpython",
+        "implementation_version": "3.12.1",
+        "python_version": "3.12",
+        "python_full_version": "3.12.1",
+        "extra": "",
+    }
+
+
+def parse_requirements_in(filepath):
+    """Parse a requirements.in-style file into a list of requirement strings.
+
+    Strips comments (#) and blank lines.  Returns raw requirement strings
+    like ``["Markdown", "narwhals>=2.0", "git+https://..."]``.
     """
-    pyodide_dir = Path(output_dir) / "pyodide"
-    pyodide_lock = pyodide_dir / "pyodide-lock.json"
+    lines = []
+    for raw in Path(filepath).read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            lines.append(line)
+    return lines
 
-    # Normalize package name for filesystem (underscores)
-    pkg_normalized = package_name.lower().replace("-", "_")
-    pkg_key = package_name.lower()
 
-    # Check current version in pyodide-lock.json
-    current_version = None
-    if pyodide_lock.exists():
-        lock_data = json.loads(pyodide_lock.read_text())
-        if pkg_key in lock_data.get("packages", {}):
-            current_version = lock_data["packages"][pkg_key].get("version")
+def _load_pyodide_lock(output_dir):
+    """Load pyodide-lock.json and return (lock_data, path)."""
+    p = Path(output_dir) / "pyodide" / "pyodide-lock.json"
+    if p.exists():
+        return json.loads(p.read_text()), p
+    return None, p
 
-    # Fetch package info from PyPI
+
+def _save_pyodide_lock(lock_data, lock_path):
+    """Write pyodide-lock.json back to disk."""
+    lock_path.write_text(json.dumps(lock_data, indent=2))
+
+
+def _pyodide_has_package(lock_data, name, specifier=None):
+    """Check if pyodide-lock.json already satisfies *name* with *specifier*.
+
+    Returns ``True`` if the bundled version matches (or no specifier given).
+    """
+    if lock_data is None:
+        return False
+    pkg_key = name.lower().replace("-", "_")
+    # Try both normalized forms (underscore and hyphen)
+    entry = lock_data.get("packages", {}).get(pkg_key)
+    if entry is None:
+        pkg_key_hyphen = name.lower().replace("_", "-")
+        entry = lock_data.get("packages", {}).get(pkg_key_hyphen)
+    if entry is None:
+        return False
+    if specifier is None:
+        return True
+    from packaging.version import Version
+    from packaging.specifiers import SpecifierSet
     try:
-        pypi_url = f"https://pypi.org/pypi/{package_name}/json"
-        req = urllib.request.Request(pypi_url)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        return Version(entry["version"]) in SpecifierSet(str(specifier))
+    except Exception:
+        return True  # if we can't parse, assume it's fine
 
-        latest_version = data["info"]["version"]
-        urls = data["releases"].get(latest_version, [])
 
-        # Find py3-none-any wheel
-        wheel_info = None
-        for u in urls:
-            if u["filename"].endswith("-py3-none-any.whl"):
-                wheel_info = u
+def _register_wheel_in_lock(lock_data, lock_path, wheel_path, name, version,
+                             imports=None):
+    """Add or update a wheel entry in pyodide-lock.json."""
+    if lock_data is None:
+        return
+    pkg_key = name.lower().replace("-", "_")
+    wheel_sha = hashlib.sha256(Path(wheel_path).read_bytes()).hexdigest()
+    lock_data.setdefault("packages", {})[pkg_key] = {
+        "name": pkg_key,
+        "version": version,
+        "file_name": Path(wheel_path).name,
+        "install_dir": "site",
+        "sha256": wheel_sha,
+        "package_type": "package",
+        "depends": [],
+        "imports": imports or [pkg_key],
+    }
+    _save_pyodide_lock(lock_data, lock_path)
+
+
+def _extract_wheel_metadata(wheel_path):
+    """Read METADATA from a wheel and return (name, version, requires_dist, imports).
+
+    ``requires_dist`` is a list of raw PEP 508 dependency strings (or []).
+    ``imports`` is a list of top-level importable names derived from the wheel
+    contents.
+    """
+    with zipfile.ZipFile(wheel_path) as zf:
+        # Find the .dist-info/METADATA file
+        metadata_path = None
+        for entry in zf.namelist():
+            if entry.endswith(".dist-info/METADATA"):
+                metadata_path = entry
+                break
+        if metadata_path is None:
+            return None, None, [], []
+
+        text = zf.read(metadata_path).decode("utf-8")
+
+        name = None
+        version = None
+        requires = []
+        for line in text.splitlines():
+            if line.startswith("Name:"):
+                name = line.split(":", 1)[1].strip()
+            elif line.startswith("Version:"):
+                version = line.split(":", 1)[1].strip()
+            elif line.startswith("Requires-Dist:"):
+                requires.append(line.split(":", 1)[1].strip())
+
+        # Derive importable top-level names from wheel contents
+        top_level_path = None
+        for entry in zf.namelist():
+            if entry.endswith(".dist-info/top_level.txt"):
+                top_level_path = entry
+                break
+        if top_level_path:
+            imports = [
+                l.strip() for l in zf.read(top_level_path).decode().splitlines()
+                if l.strip()
+            ]
+        else:
+            # Guess from package directories (first-level dirs that aren't .dist-info)
+            imports = sorted({
+                entry.split("/")[0]
+                for entry in zf.namelist()
+                if "/" in entry
+                and not entry.split("/")[0].endswith(".dist-info")
+                and not entry.split("/")[0].endswith(".data")
+            })
+            if not imports:
+                imports = [name.lower().replace("-", "_")] if name else []
+
+        return name, version, requires, imports
+
+
+def _filter_requires_dist(requires_dist):
+    """Filter a Requires-Dist list down to dependencies needed in Pyodide.
+
+    Drops extras-only deps, platform-specific deps that don't match
+    emscripten/wasm32, and python_version markers < 3.12.
+    """
+    from packaging.requirements import Requirement
+
+    marker_env = _pyodide_marker_env()
+    result = []
+    for dep_str in requires_dist:
+        try:
+            req = Requirement(dep_str)
+        except Exception:
+            continue
+        # Skip if the marker doesn't match Pyodide's environment
+        if req.marker and not req.marker.evaluate(marker_env):
+            continue
+        # Skip extras (we never install with extras)
+        if req.extras:
+            continue
+        result.append(req)
+    return result
+
+
+def build_git_wheel(git_url, dest_dir):
+    """Build a wheel from a git URL and return metadata.
+
+    Returns ``(wheel_path, name, version, requires_dist, imports)``
+    or ``None`` if the build fails or produces a non-pure wheel.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        env = _get_pip_env()
+        result = subprocess.run(
+            ["pip", "wheel", "--no-deps", "--wheel-dir", tmpdir, git_url],
+            env=env, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"  ⚠ pip wheel failed for {git_url}:\n{result.stderr}")
+            return None
+
+        wheels = list(Path(tmpdir).glob("*.whl"))
+        if not wheels:
+            print(f"  ⚠ No wheel produced for {git_url}")
+            return None
+        whl = wheels[0]
+
+        # Verify it's a pure-Python wheel
+        if "py3-none-any" not in whl.name and "py2.py3-none-any" not in whl.name:
+            # Double-check via WHEEL metadata
+            with zipfile.ZipFile(whl) as zf:
+                wheel_meta = None
+                for entry in zf.namelist():
+                    if entry.endswith(".dist-info/WHEEL"):
+                        wheel_meta = zf.read(entry).decode()
+                        break
+            if wheel_meta and "Tag: py3-none-any" not in wheel_meta \
+                    and "Tag: py2.py3-none-any" not in wheel_meta:
+                print(f"  ⚠ Skipping {whl.name}: not a pure-Python wheel")
+                return None
+
+        name, version, requires_dist, imports = _extract_wheel_metadata(whl)
+        dest = Path(dest_dir) / whl.name
+        shutil.copy(whl, dest)
+        return dest, name, version, requires_dist, imports
+
+
+def _find_best_version(pypi_data, specifier=None):
+    """Find the best matching version from PyPI data given a specifier.
+
+    Returns ``(version, wheel_info)`` or ``(None, None)``.
+    """
+    from packaging.version import Version
+    from packaging.specifiers import SpecifierSet
+
+    spec = SpecifierSet(str(specifier)) if specifier else SpecifierSet()
+
+    # Try latest version first (most common case)
+    latest = pypi_data["info"]["version"]
+    if Version(latest) in spec:
+        for u in pypi_data["releases"].get(latest, []):
+            if u["filename"].endswith("-py3-none-any.whl") or \
+               u["filename"].endswith("-py2.py3-none-any.whl"):
+                return latest, u
+        # Latest matches specifier but has no pure wheel — fall through to
+        # scan other versions.
+
+    # Scan all releases for the newest matching version with a pure wheel
+    candidates = []
+    for ver_str, files in pypi_data["releases"].items():
+        try:
+            ver = Version(ver_str)
+        except Exception:
+            continue
+        if ver not in spec:
+            continue
+        if ver.is_prerelease or ver.is_devrelease:
+            continue
+        for u in files:
+            if u["filename"].endswith("-py3-none-any.whl") or \
+               u["filename"].endswith("-py2.py3-none-any.whl"):
+                candidates.append((ver, ver_str, u))
                 break
 
-        if not wheel_info:
-            print(f"  ⚠ No pure Python wheel found for {package_name}")
-            return False
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1], candidates[0][2]
 
-        # Check if we need to download (new package or upgrade needed)
-        need_download = False
-        if current_version is None:
-            need_download = True
-        elif current_version != latest_version:
-            # Compare versions - download if PyPI has newer
-            from packaging.version import Version
-            if Version(latest_version) > Version(current_version):
-                print(f"  ↑ Upgrading {package_name}: {current_version} → {latest_version}")
-                need_download = True
-                # Remove old wheel files
-                for old_whl in pyodide_dir.glob(f"{pkg_normalized}*.whl"):
-                    old_whl.unlink()
-            else:
-                print(f"  ✓ {package_name} {current_version} already up to date")
-                return True
-        else:
-            print(f"  ✓ {package_name} {current_version} already present")
-            return True
 
-        wheel_url = wheel_info["url"]
-        wheel_name = wheel_info["filename"]
-        wheel_sha = wheel_info.get("digests", {}).get("sha256", "")
+def download_pypi_package(output_dir, name, specifier=None, visited=None):
+    """Download a PyPI package and its transitive dependencies.
 
-        print(f"  ↓ Downloading {package_name} {latest_version}")
-        download(wheel_url, pyodide_dir / wheel_name)
+    Returns ``True`` if the package was successfully handled, ``False`` on
+    failure.  Populates *visited* to avoid processing the same package twice.
+    """
+    if visited is None:
+        visited = {}
 
-        # Update pyodide-lock.json (add or update entry)
-        if pyodide_lock.exists():
-            lock_data = json.loads(pyodide_lock.read_text())
-            if "packages" in lock_data:
-                lock_data["packages"][pkg_key] = {
-                    "name": pkg_key,
-                    "version": latest_version,
-                    "file_name": wheel_name,
-                    "install_dir": "site",
-                    "sha256": wheel_sha,
-                    "package_type": "package",
-                    "depends": [],
-                    "imports": imports or [pkg_normalized]
-                }
-                pyodide_lock.write_text(json.dumps(lock_data, indent=2))
-                if current_version:
-                    print(f"  ✓ Updated {package_name} in pyodide-lock.json")
-                else:
-                    print(f"  ✓ Added {package_name} to pyodide-lock.json")
+    from packaging.requirements import Requirement
+
+    pkg_key = name.lower().replace("-", "_")
+    pyodide_dir = Path(output_dir) / "pyodide"
+    lock_data, lock_path = _load_pyodide_lock(output_dir)
+
+    # Already processed this run?
+    if pkg_key in visited:
         return True
 
+    # Already in pyodide at a satisfying version?
+    if _pyodide_has_package(lock_data, name, specifier):
+        bundled_ver = lock_data["packages"].get(
+            pkg_key, lock_data["packages"].get(name.lower().replace("_", "-"), {})
+        ).get("version", "?")
+        print(f"  ✓ {name} {bundled_ver} already in Pyodide (satisfies {specifier or 'any'})")
+        visited[pkg_key] = bundled_ver
+        return True
+
+    # Fetch from PyPI
+    index_url = _get_pypi_index_url()
+    # For custom indexes, fall back to standard simple API
+    if "pypi.org" in index_url:
+        pypi_url = f"https://pypi.org/pypi/{name}/json"
+    else:
+        # For custom indexes, try PyPI JSON API as fallback
+        pypi_url = f"https://pypi.org/pypi/{name}/json"
+
+    try:
+        with _pypi_urlopen(pypi_url) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        print(f"  ⚠ Failed to download {package_name}: {e}")
+        print(f"  ⚠ Failed to fetch PyPI metadata for {name}: {e}")
         return False
 
+    version, wheel_info = _find_best_version(data, specifier)
+    if version is None or wheel_info is None:
+        print(f"  ⚠ No pure-Python wheel found for {name}{specifier or ''}")
+        return False
 
-def download_extra_packages(output_dir):
-    """Download additional packages required by marimo that aren't in Pyodide."""
+    visited[pkg_key] = version
+
+    # Check if this exact version is already downloaded
+    wheel_name = wheel_info["filename"]
+    wheel_dest = pyodide_dir / wheel_name
+    if wheel_dest.exists():
+        print(f"  ✓ {name} {version} already downloaded")
+    else:
+        # Remove any older wheels for this package
+        for old_whl in pyodide_dir.glob(f"{pkg_key}-*.whl"):
+            old_whl.unlink()
+        for old_whl in pyodide_dir.glob(f"{name.replace('-', '_')}*.whl"):
+            old_whl.unlink()
+
+        print(f"  ↓ Downloading {name} {version}")
+        wheel_url = wheel_info["url"]
+        download(wheel_url, wheel_dest)
+
+    # Extract imports from wheel metadata
+    _, _, requires_dist, imports = _extract_wheel_metadata(wheel_dest)
+
+    # Register in pyodide-lock.json
+    lock_data, lock_path = _load_pyodide_lock(output_dir)
+    _register_wheel_in_lock(lock_data, lock_path, wheel_dest, name, version,
+                            imports=imports)
+
+    # Resolve transitive dependencies
+    filtered_deps = _filter_requires_dist(requires_dist)
+    for dep_req in filtered_deps:
+        dep_key = dep_req.name.lower().replace("-", "_")
+        if dep_key in visited:
+            continue
+        # Reload lock_data each time (may have been updated by recursive calls)
+        lock_data, _ = _load_pyodide_lock(output_dir)
+        if _pyodide_has_package(lock_data, dep_req.name, dep_req.specifier):
+            visited[dep_key] = "bundled"
+            continue
+        print(f"    ↳ Transitive dep: {dep_req.name}{dep_req.specifier or ''}")
+        download_pypi_package(
+            output_dir, dep_req.name,
+            specifier=dep_req.specifier if dep_req.specifier else None,
+            visited=visited,
+        )
+
+    return True
+
+
+def resolve_and_download_packages(output_dir, requirements):
+    """Process a list of requirement strings, downloading wheels and deps.
+
+    Handles both PyPI packages and ``git+https://...`` URLs.
+    """
+    from packaging.requirements import Requirement
+
+    visited = {}
+    pyodide_dir = Path(output_dir) / "pyodide"
+    lock_data, lock_path = _load_pyodide_lock(output_dir)
+
+    for req_str in requirements:
+        if req_str.startswith("git+"):
+            # Git URL — build wheel, register, resolve deps
+            print(f"\n  ◆ Building from git: {req_str}")
+            result = build_git_wheel(req_str, pyodide_dir)
+            if result is None:
+                continue
+            wheel_path, name, version, requires_dist, imports = result
+            pkg_key = name.lower().replace("-", "_")
+            visited[pkg_key] = version
+
+            # Register in lock
+            lock_data, lock_path = _load_pyodide_lock(output_dir)
+            _register_wheel_in_lock(lock_data, lock_path, wheel_path, name,
+                                     version, imports=imports)
+            print(f"  ✓ Built and registered {name} {version}")
+
+            # Resolve transitive deps
+            filtered_deps = _filter_requires_dist(requires_dist)
+            for dep_req in filtered_deps:
+                dep_key = dep_req.name.lower().replace("-", "_")
+                if dep_key in visited:
+                    continue
+                lock_data, _ = _load_pyodide_lock(output_dir)
+                if _pyodide_has_package(lock_data, dep_req.name, dep_req.specifier):
+                    visited[dep_key] = "bundled"
+                    continue
+                print(f"    ↳ Transitive dep: {dep_req.name}{dep_req.specifier or ''}")
+                download_pypi_package(
+                    output_dir, dep_req.name,
+                    specifier=dep_req.specifier if dep_req.specifier else None,
+                    visited=visited,
+                )
+        else:
+            # PyPI package (possibly with version specifier)
+            try:
+                req = Requirement(req_str)
+            except Exception as e:
+                print(f"  ⚠ Could not parse requirement '{req_str}': {e}")
+                continue
+            spec = req.specifier if req.specifier else None
+            download_pypi_package(output_dir, req.name, specifier=spec,
+                                   visited=visited)
+
+
+def download_wasm_extras(output_dir):
+    """Download packages from requirements-wasm-extras.in and their dependencies."""
     print("\n══════════════════════════════════════════")
     print("Step 6c: Downloading extra packages")
     print("══════════════════════════════════════════")
 
-    # Packages marimo needs that aren't in the Pyodide full distribution
-    # or need newer versions than Pyodide provides
-    extra_packages = [
-        # Core marimo dependencies not in Pyodide
-        ("Markdown", ["markdown"]),
-        ("pymdown-extensions", ["pymdownx"]),
-        ("tomlkit", ["tomlkit"]),
-        ("itsdangerous", ["itsdangerous"]),
-        # narwhals 2.x needed (Pyodide has 1.41, marimo needs >=2.0 for stable.v2)
-        ("narwhals", ["narwhals"]),
-    ]
+    req_file = Path("requirements-wasm-extras.in")
+    if not req_file.exists():
+        print("  ℹ No requirements-wasm-extras.in found, skipping")
+        return
 
-    for pkg_name, imports in extra_packages:
-        download_extra_package(output_dir, pkg_name, imports)
+    requirements = parse_requirements_in(req_file)
+    if not requirements:
+        print("  ℹ requirements-wasm-extras.in is empty, skipping")
+        return
+
+    print(f"  ℹ Found {len(requirements)} top-level requirements")
+    resolve_and_download_packages(output_dir, requirements)
 
 
 def patch_micropip_for_offline(output_dir):
@@ -1354,8 +1714,8 @@ def main():
         marimo_version = "0.19.7"  # fallback
     download_marimo_base(output_dir, marimo_version)
 
-    # Step 6c: Download extra packages (Markdown, etc.)
-    download_extra_packages(output_dir)
+    # Step 6c: Download extra packages from requirements-wasm-extras.in
+    download_wasm_extras(output_dir)
 
     # Step 7: Configure offline packages
     patch_micropip_for_offline(output_dir)
