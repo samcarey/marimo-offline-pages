@@ -1136,6 +1136,11 @@ def parse_requirements_in(filepath):
     return lines
 
 
+def _pyodide_normalize(name):
+    """Normalize a package name to Pyodide's lock-file key format (lowercase, hyphens)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def _load_pyodide_lock(output_dir):
     """Load pyodide-lock.json and return (lock_data, path)."""
     p = Path(output_dir) / "pyodide" / "pyodide-lock.json"
@@ -1156,12 +1161,8 @@ def _pyodide_has_package(lock_data, name, specifier=None):
     """
     if lock_data is None:
         return False
-    pkg_key = name.lower().replace("-", "_")
-    # Try both normalized forms (underscore and hyphen)
+    pkg_key = _pyodide_normalize(name)
     entry = lock_data.get("packages", {}).get(pkg_key)
-    if entry is None:
-        pkg_key_hyphen = name.lower().replace("_", "-")
-        entry = lock_data.get("packages", {}).get(pkg_key_hyphen)
     if entry is None:
         return False
     if specifier is None:
@@ -1179,7 +1180,8 @@ def _register_wheel_in_lock(lock_data, lock_path, wheel_path, name, version,
     """Add or update a wheel entry in pyodide-lock.json."""
     if lock_data is None:
         return
-    pkg_key = name.lower().replace("-", "_")
+    pkg_key = _pyodide_normalize(name)
+    pkg_import = name.lower().replace("-", "_")
     wheel_sha = hashlib.sha256(Path(wheel_path).read_bytes()).hexdigest()
     lock_data.setdefault("packages", {})[pkg_key] = {
         "name": pkg_key,
@@ -1189,7 +1191,7 @@ def _register_wheel_in_lock(lock_data, lock_path, wheel_path, name, version,
         "sha256": wheel_sha,
         "package_type": "package",
         "depends": [],
-        "imports": imports or [pkg_key],
+        "imports": imports or [pkg_import],
     }
     _save_pyodide_lock(lock_data, lock_path)
 
@@ -1371,7 +1373,7 @@ def download_pypi_package(output_dir, name, specifier=None, visited=None):
 
     from packaging.requirements import Requirement
 
-    pkg_key = name.lower().replace("-", "_")
+    pkg_key = _pyodide_normalize(name)
     pyodide_dir = Path(output_dir) / "pyodide"
     lock_data, lock_path = _load_pyodide_lock(output_dir)
 
@@ -1381,9 +1383,7 @@ def download_pypi_package(output_dir, name, specifier=None, visited=None):
 
     # Already in pyodide at a satisfying version?
     if _pyodide_has_package(lock_data, name, specifier):
-        bundled_ver = lock_data["packages"].get(
-            pkg_key, lock_data["packages"].get(name.lower().replace("_", "-"), {})
-        ).get("version", "?")
+        bundled_ver = lock_data["packages"].get(pkg_key, {}).get("version", "?")
         print(f"  ✓ {name} {bundled_ver} already in Pyodide (satisfies {specifier or 'any'})")
         visited[pkg_key] = bundled_ver
         return True
@@ -1417,10 +1417,11 @@ def download_pypi_package(output_dir, name, specifier=None, visited=None):
     if wheel_dest.exists():
         print(f"  ✓ {name} {version} already downloaded")
     else:
-        # Remove any older wheels for this package
-        for old_whl in pyodide_dir.glob(f"{pkg_key}-*.whl"):
+        # Remove any older wheels for this package (try both hyphen and underscore forms)
+        pkg_under = name.lower().replace("-", "_")
+        for old_whl in pyodide_dir.glob(f"{pkg_under}-*.whl"):
             old_whl.unlink()
-        for old_whl in pyodide_dir.glob(f"{name.replace('-', '_')}*.whl"):
+        for old_whl in pyodide_dir.glob(f"{pkg_key}-*.whl"):
             old_whl.unlink()
 
         print(f"  ↓ Downloading {name} {version}")
@@ -1438,7 +1439,7 @@ def download_pypi_package(output_dir, name, specifier=None, visited=None):
     # Resolve transitive dependencies
     filtered_deps = _filter_requires_dist(requires_dist)
     for dep_req in filtered_deps:
-        dep_key = dep_req.name.lower().replace("-", "_")
+        dep_key = _pyodide_normalize(dep_req.name)
         if dep_key in visited:
             continue
         # Reload lock_data each time (may have been updated by recursive calls)
@@ -1475,7 +1476,7 @@ def resolve_and_download_packages(output_dir, requirements):
             if result is None:
                 continue
             wheel_path, name, version, requires_dist, imports = result
-            pkg_key = name.lower().replace("-", "_")
+            pkg_key = _pyodide_normalize(name)
             visited[pkg_key] = version
 
             # Register in lock
@@ -1487,7 +1488,7 @@ def resolve_and_download_packages(output_dir, requirements):
             # Resolve transitive deps
             filtered_deps = _filter_requires_dist(requires_dist)
             for dep_req in filtered_deps:
-                dep_key = dep_req.name.lower().replace("-", "_")
+                dep_key = _pyodide_normalize(dep_req.name)
                 if dep_key in visited:
                     continue
                 lock_data, _ = _load_pyodide_lock(output_dir)
