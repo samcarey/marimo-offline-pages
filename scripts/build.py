@@ -276,6 +276,102 @@ def download_pyodide(version, output_dir):
 
 
 # ---------------------------------------------------------------------------
+# Step 3b: Strip bundled Pyodide packages (--slim mode)
+# ---------------------------------------------------------------------------
+
+def _get_pyodide_cdn_url(pyodide_version):
+    """Read a custom Pyodide CDN URL from pip.conf [pyodide] section.
+
+    Falls back to the default jsDelivr CDN URL.
+    """
+    pip_conf = Path("pip.conf")
+    if pip_conf.exists():
+        cfg = configparser.ConfigParser()
+        cfg.read(pip_conf)
+        url = cfg.get("pyodide", "cdn-url", fallback=None)
+        if url:
+            return url.rstrip("/")
+    return f"https://cdn.jsdelivr.net/pyodide/v{pyodide_version}/full"
+
+
+def strip_pyodide_packages(output_dir, pyodide_version):
+    """Strip bundled Pyodide packages for semi-offline deployment.
+
+    Keeps core runtime files and packages listed in requirements-wasm-extras.in
+    locally. All other packages have their ``file_name`` in pyodide-lock.json
+    rewritten to absolute CDN URLs so Pyodide fetches them on demand.
+
+    This runs BEFORE download_wasm_extras() — it only uses the extras file to
+    determine which package NAMES to keep local. The actual wheels are
+    downloaded and registered later by the existing download_wasm_extras() flow.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 3b: Stripping bundled Pyodide packages (--slim)")
+    print("══════════════════════════════════════════")
+
+    pyodide_dir = Path(output_dir) / "pyodide"
+    lock_data, lock_path = _load_pyodide_lock(output_dir)
+    if lock_data is None:
+        patch_error("slim-strip", "pyodide-lock.json not found")
+        return
+
+    cdn_base = _get_pyodide_cdn_url(pyodide_version)
+    print(f"  CDN base URL: {cdn_base}")
+
+    # Determine the set of packages to keep local
+    keep_local = {"marimo-base"}
+
+    req_file = Path("requirements-wasm-extras.in")
+    if req_file.exists():
+        for req_str in parse_requirements_in(req_file):
+            if req_str.startswith("git+"):
+                # Extract package name from git URL (best-effort, registered later)
+                continue
+            from packaging.requirements import Requirement
+            try:
+                req = Requirement(req_str)
+                keep_local.add(_pyodide_normalize(req.name))
+            except Exception:
+                pass
+
+    print(f"  Keeping local: {sorted(keep_local)}")
+
+    packages = lock_data.get("packages", {})
+    kept_count = 0
+    redirected_count = 0
+    bytes_saved = 0
+
+    for pkg_key, entry in packages.items():
+        file_name = entry.get("file_name", "")
+        if not file_name:
+            continue
+
+        # Already an absolute URL — skip
+        if file_name.startswith("http://") or file_name.startswith("https://"):
+            continue
+
+        if pkg_key in keep_local:
+            kept_count += 1
+            continue
+
+        # Delete the local file
+        local_file = pyodide_dir / file_name
+        if local_file.exists():
+            bytes_saved += local_file.stat().st_size
+            local_file.unlink()
+
+        # Rewrite file_name to absolute CDN URL
+        entry["file_name"] = f"{cdn_base}/{file_name}"
+        redirected_count += 1
+
+    _save_pyodide_lock(lock_data, lock_path)
+
+    print(f"  ✓ Kept local: {kept_count} packages")
+    print(f"  ✓ Redirected to CDN: {redirected_count} packages")
+    print(f"  ✓ Space saved: {bytes_saved / (1024 * 1024):.1f} MB")
+
+
+# ---------------------------------------------------------------------------
 # Step 4: Download Google Fonts
 # ---------------------------------------------------------------------------
 
@@ -1743,6 +1839,67 @@ def patch_micropip_for_offline(output_dir):
     print("    See: https://pyodide.org/en/stable/usage/loading-packages.html")
 
 
+def inject_micropip_index(output_dir):
+    """Configure micropip to use a custom PyPI index with fallback (--slim mode).
+
+    When a custom index-url is configured in pip.conf, this patches worker-*.js
+    to call ``micropip.set_index_urls()`` with the custom index first and
+    public PyPI as fallback.  If no custom index is configured, micropip's
+    default (pypi.org) is used and no patching is needed.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 7: Configuring micropip index (--slim)")
+    print("══════════════════════════════════════════")
+
+    index_url = _get_pypi_index_url()
+    if "pypi.org" in index_url:
+        print("  ℹ No custom PyPI index configured — micropip defaults to pypi.org")
+        return
+
+    # Ensure the custom index URL ends with /simple/
+    simple_url = index_url.rstrip("/")
+    if not simple_url.endswith("/simple"):
+        simple_url += "/simple/"
+    else:
+        simple_url += "/"
+
+    print(f"  Custom index: {simple_url}")
+    print(f"  Fallback: https://pypi.org/simple/")
+
+    patched = 0
+    for path in Path(output_dir).rglob("*worker*.js"):
+        if "pyodide" in str(path):
+            continue  # Skip Pyodide's own files
+        text = path.read_text(errors="ignore")
+
+        # Find the first .runPythonAsync( call to identify the Pyodide
+        # instance variable name (e.g., n.runPythonAsync(...))
+        m = re.search(r'(\w+)\.runPythonAsync\(', text)
+        if not m:
+            continue
+
+        instance_var = m.group(1)
+        inject_code = (
+            f'await {instance_var}.runPythonAsync('
+            f"'import micropip;micropip.set_index_urls("
+            f'[\\"{simple_url}\\",\\"https://pypi.org/simple/\\"])'
+            f"');"
+        )
+
+        # Inject before the first runPythonAsync call
+        insert_pos = m.start()
+        text = text[:insert_pos] + inject_code + text[insert_pos:]
+        path.write_text(text)
+        patched += 1
+        print(f"  ✓ Injected micropip index config: {path}")
+        print(f"    instance={instance_var}")
+
+    if patched == 0:
+        print("  ⚠ No worker JS files found to patch for micropip index")
+    else:
+        print(f"  ✓ Patched {patched} worker files")
+
+
 # ---------------------------------------------------------------------------
 # Step 8: Create index page
 # ---------------------------------------------------------------------------
@@ -1851,7 +2008,7 @@ _REQUIRED_MARKERS = [
 ]
 
 
-def verify_build(output_dir):
+def verify_build(output_dir, slim=False):
     """Scan the built site for leftover CDN URLs and missing patch markers.
 
     Any problem is recorded via ``patch_error`` so the build fails with a
@@ -1976,6 +2133,25 @@ def verify_build(output_dir):
     else:
         patch_error("verify-packages", "pyodide-lock.json not found")
 
+    # --- Slim mode: verify lock file has absolute URLs for stripped packages ---
+    if slim and lock_path.exists():
+        lock_data = json.loads(lock_path.read_text())
+        packages = lock_data.get("packages", {})
+        local_count = 0
+        remote_count = 0
+        for pkg_key, entry in packages.items():
+            fn = entry.get("file_name", "")
+            if fn.startswith("http://") or fn.startswith("https://"):
+                remote_count += 1
+            else:
+                local_count += 1
+        if remote_count == 0:
+            patch_error("verify-slim",
+                        "Slim mode active but no packages have absolute CDN "
+                        "URLs in pyodide-lock.json — stripping may have failed")
+        else:
+            print(f"  ✓ Slim mode: {local_count} local, {remote_count} remote packages")
+
     print()
 
 
@@ -2018,6 +2194,11 @@ def main():
         "--pyodide-version", default=None,
         help="Override Pyodide version (auto-detected from exports by default)"
     )
+    parser.add_argument(
+        "--slim", action="store_true",
+        help="Strip bundled Pyodide packages for semi-offline deployment. "
+             "Core runtime is served locally; packages load from CDN/PyPI on demand."
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -2047,6 +2228,10 @@ def main():
 
     # Step 3: Download Pyodide
     download_pyodide(pyodide_version, output_dir)
+
+    # Step 3b: Strip bundled packages (--slim mode)
+    if args.slim:
+        strip_pyodide_packages(output_dir, pyodide_version)
 
     # Step 4: Download Google Fonts
     download_google_fonts(output_dir)
@@ -2080,8 +2265,11 @@ def main():
     # Step 6c: Download extra packages from requirements-wasm-extras.in
     download_wasm_extras(output_dir)
 
-    # Step 7: Configure offline packages
-    patch_micropip_for_offline(output_dir)
+    # Step 7: Configure package loading
+    if args.slim:
+        inject_micropip_index(output_dir)
+    else:
+        patch_micropip_for_offline(output_dir)
 
     # Step 8: Create index page
     create_index_page(output_dir, notebooks)
@@ -2090,7 +2278,7 @@ def main():
     add_metadata_files(output_dir)
 
     # Step 10: Verify the build
-    verify_build(output_dir)
+    verify_build(output_dir, slim=args.slim)
     check_patch_errors()
 
     # Summary
