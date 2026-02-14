@@ -969,6 +969,16 @@ def patch_wasm_share_links(output_dir, single_notebook=False):
         var el=document.querySelector("marimo-code");
         if(el)el.remove();
       }
+      // --- Reload on hash change ---
+      // Navigating to a different #code/… URL in the same tab only fires
+      // a hashchange event (no page reload).  Force a full reload so the
+      // new notebook code is loaded from the updated hash.
+      window.addEventListener("hashchange",function(){
+        var nh=window.location.hash;
+        if(nh&&nh.indexOf("#code/")===0){
+          window.location.reload();
+        }
+      });
       // --- Show a user-friendly message when share fails ---
       // The patched share function throws when code isn't ready yet.
       // Catch the unhandled rejection and surface it as an alert.
