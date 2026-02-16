@@ -42,6 +42,7 @@ pages:
       artifacts: true
   script:
     # GitLab Pages requires the output directory to be named "public"
+    - rm -rf public
     - mv _site public
   artifacts:
     paths:
