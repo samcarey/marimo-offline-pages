@@ -7,6 +7,7 @@ Python packages, fonts — is bundled into the static site.
 Built for air-gapped environments where browsers can only access the GitLab
 instance.
 
+
 ## Quick start
 
 ### Prerequisites
