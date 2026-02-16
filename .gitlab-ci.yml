@@ -7,6 +7,7 @@
 # Equivalent to the GitHub Actions workflow in .github/workflows/deploy.yml.
 
 stages:
+  - upload
   - build
   - deploy
 
@@ -19,6 +20,29 @@ cache:
   key: pip-cache
   paths:
     - .pip-cache/
+
+# Upload Pyodide packages to the GitLab Generic Package Registry.
+# Run this once per Pyodide version to populate the registry, then
+# configure pip.conf [pyodide] cdn-url to point to it.
+# Triggered manually from the GitLab UI (Run pipeline → play button).
+upload-pyodide:
+  stage: upload
+  image: python:3.12-slim
+  rules:
+    - if: $CI_COMMIT_BRANCH == "pages"
+      when: manual
+      allow_failure: true
+  script:
+    # Set PYODIDE_VERSION as a CI/CD variable when triggering this job.
+    # Find it in the build log or run: python -c "import marimo._pyodide.pyodide_versions as pv; print(pv.PYODIDE_VERSION)"
+    - |
+      if [ -z "$PYODIDE_VERSION" ]; then
+        echo "Error: Set the PYODIDE_VERSION variable (e.g. 0.27.7) when running this job."
+        echo "Check the build job log for the version marimo uses."
+        exit 1
+      fi
+    - echo "Uploading Pyodide $PYODIDE_VERSION packages to registry..."
+    - python scripts/upload_pyodide_packages.py --pyodide-version "$PYODIDE_VERSION"
 
 build:
   stage: build
