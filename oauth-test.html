@@ -46,6 +46,9 @@
   <label>OAuth Application ID <span class="info">(from User Settings &rarr; Applications)</span></label>
   <input id="cfg-clientid" placeholder="e.g. a1b2c3d4e5f6..." />
 
+  <label>Application Secret <span class="info">(leave blank for public/non-confidential apps)</span></label>
+  <input id="cfg-secret" type="password" placeholder="optional — only if app is confidential" />
+
   <label>Private project ID to test</label>
   <input id="cfg-project" value="58961" />
 
@@ -84,6 +87,7 @@ function saveConfig() {
   const cfg = {
     gitlab:   $('cfg-gitlab').value.replace(/\/+$/, ''),
     clientId: $('cfg-clientid').value.trim(),
+    secret:   $('cfg-secret').value.trim(),
     project:  $('cfg-project').value.trim(),
     ref:      $('cfg-ref').value.trim() || 'main',
   };
@@ -97,6 +101,7 @@ function loadConfig() {
     const c = JSON.parse(s);
     $('cfg-gitlab').value   = c.gitlab   || '';
     $('cfg-clientid').value = c.clientId  || '';
+    $('cfg-secret').value   = c.secret    || '';
     $('cfg-project').value  = c.project   || '';
     $('cfg-ref').value      = c.ref       || 'main';
     return c;
@@ -104,10 +109,11 @@ function loadConfig() {
 }
 
 /* ------------------------------------------------------------------ */
-/*  OAuth — Implicit Grant (works over plain HTTP, no crypto.subtle)   */
+/*  OAuth — Authorization Code with PKCE (plain method)                */
+/*  Works over HTTP (no crypto.subtle needed for "plain")              */
 /* ------------------------------------------------------------------ */
-function randomState() {
-  const a = new Uint8Array(20);
+function randomString(len) {
+  const a = new Uint8Array(len);
   crypto.getRandomValues(a);
   return Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
 }
@@ -116,61 +122,114 @@ function doLogin() {
   const cfg = saveConfig();
   if (!cfg.clientId) { alert('Enter your OAuth Application ID first.'); return; }
 
-  const state = randomState();
+  const state = randomString(20);
+  const codeVerifier = randomString(32);   // 64 hex chars
+
   sessionStorage.setItem('oauth_state', state);
+  sessionStorage.setItem('oauth_code_verifier', codeVerifier);
 
   // redirect_uri must exactly match one registered in the OAuth app
   const redirectUri = window.location.href.split('?')[0].split('#')[0];
   sessionStorage.setItem('oauth_redirect_uri', redirectUri);
 
   const params = new URLSearchParams({
-    client_id:     cfg.clientId,
-    redirect_uri:  redirectUri,
-    response_type: 'token',        // Implicit Grant
-    scope:         'read_api',
-    state:         state,
+    client_id:             cfg.clientId,
+    redirect_uri:          redirectUri,
+    response_type:         'code',
+    scope:                 'read_api',
+    state:                 state,
+    code_challenge:        codeVerifier,     // plain = verifier IS the challenge
+    code_challenge_method: 'plain',
   });
 
   addStep('Redirecting to GitLab&hellip;',
-    '<span class="info mono">' + esc(cfg.gitlab + '/oauth/authorize') + '</span>', 'wait');
+    '<span class="info mono">Authorization Code + PKCE (plain)</span>', 'wait');
 
   window.location.href = cfg.gitlab + '/oauth/authorize?' + params;
 }
 
-/* Parse the #access_token=...&state=... fragment on callback */
-function handleImplicitCallback() {
-  const hash = window.location.hash.substring(1);   // strip leading #
-  if (!hash) return false;
+/* Handle ?code=...&state=... callback and exchange for token */
+async function handleCodeCallback() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('code');
+  const state = params.get('state');
+  if (!code) return false;
 
-  const p = new URLSearchParams(hash);
-  const token = p.get('access_token');
-  const state = p.get('state');
-  if (!token) return false;
+  // Clean URL immediately
+  history.replaceState(null, '', window.location.pathname);
 
-  // Clean the hash immediately (don't leak token in address bar / history)
-  history.replaceState(null, '', window.location.pathname + window.location.search);
-
-  // Verify state
-  const saved = sessionStorage.getItem('oauth_state');
-  if (state !== saved) {
-    addStep('OAuth callback — state mismatch',
-      '<span class="fail">Expected: ' + esc(saved || '(none)') +
-      '<br>Got: ' + esc(state || '(none)') + '</span>', 'fail');
+  const cfg = loadConfig();
+  if (!cfg) {
+    addStep('OAuth callback', '<span class="fail">Config lost — try again</span>', 'fail');
     return true;
   }
 
-  const expiresIn = p.get('expires_in') || '?';
-  const tokenType = p.get('token_type') || '?';
-  sessionStorage.setItem('oauth_token', token);
+  // Verify state
+  const savedState = sessionStorage.getItem('oauth_state');
+  if (state !== savedState) {
+    addStep('OAuth callback — state mismatch',
+      '<span class="fail">Expected: ' + esc(savedState || '(none)') +
+      '<br>Got: ' + esc(state || '(none)') + '</span>', 'fail');
+    return true;
+  }
+  addStep('OAuth callback', '<span class="ok">Authorization code received, state verified</span>', 'pass');
 
-  addStep('OAuth login successful',
-    '<span class="ok">Token received</span><br>' +
-    '<span class="info">Type: ' + esc(tokenType) +
-    ' &nbsp;|&nbsp; Expires in: ' + esc(expiresIn) + 's' +
-    ' &nbsp;|&nbsp; Token: ' + esc(token.substring(0, 8)) + '&hellip;</span>', 'pass');
+  // Exchange authorization code for access token
+  const codeVerifier = sessionStorage.getItem('oauth_code_verifier');
+  const redirectUri = sessionStorage.getItem('oauth_redirect_uri');
 
-  $('btn-test').disabled = false;
-  $('btn-login').textContent = 'Step 1 — Logged in \u2713';
+  const body = new URLSearchParams({
+    client_id:     cfg.clientId,
+    code:          code,
+    grant_type:    'authorization_code',
+    redirect_uri:  redirectUri,
+    code_verifier: codeVerifier,
+  });
+  // Include secret if provided (for confidential apps)
+  if (cfg.secret) {
+    body.set('client_secret', cfg.secret);
+  }
+
+  addStep('Exchanging code for token&hellip;',
+    '<span class="info mono">POST ' + esc(cfg.gitlab + '/oauth/token') + '</span>', 'wait');
+
+  try {
+    const resp = await fetch(cfg.gitlab + '/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      addStep('Token exchange failed',
+        '<span class="fail">HTTP ' + resp.status + '</span><br>' +
+        '<pre>' + esc(text.substring(0, 1000)) + '</pre><br>' +
+        '<span class="info">If this says "invalid_client", try making the app ' +
+        '<b>Confidential</b> and entering the Secret above.</span>', 'fail');
+      return true;
+    }
+
+    const data = await resp.json();
+    sessionStorage.setItem('oauth_token', data.access_token);
+
+    addStep('Token exchange successful',
+      '<span class="ok">Access token received</span><br>' +
+      '<span class="info">Type: ' + esc(data.token_type || '?') +
+      ' &nbsp;|&nbsp; Expires in: ' + esc(String(data.expires_in || '?')) + 's' +
+      ' &nbsp;|&nbsp; Scope: ' + esc(data.scope || '?') +
+      ' &nbsp;|&nbsp; Token: ' + esc(data.access_token.substring(0, 8)) + '&hellip;</span>', 'pass');
+
+    $('btn-test').disabled = false;
+    $('btn-login').textContent = 'Step 1 \u2014 Logged in \u2713';
+
+  } catch (err) {
+    addStep('Token exchange error',
+      '<span class="fail">' + esc(err.message) + '</span><br>' +
+      '<span class="info">This is likely a CORS issue on the /oauth/token endpoint.<br>' +
+      'Origin: ' + esc(window.location.origin) + ' &rarr; Target: ' + esc(cfg.gitlab) + '</span>', 'fail');
+  }
+
   return true;
 }
 
@@ -229,18 +288,18 @@ async function doTests() {
     const r = await apiFetch(url, token);
     if (r.ok) {
       const u = JSON.parse(r.data);
-      addStep('Test 1 — User identity',
+      addStep('Test 1 \u2014 User identity',
         '<span class="ok">Authenticated as: ' + esc(u.username || u.name) + '</span><br>' +
         '<span class="info">Auth method: ' + esc(r.method) + '</span>', 'pass');
     } else if (r.corsBlocked) {
-      addStep('Test 1 — User identity',
+      addStep('Test 1 \u2014 User identity',
         '<span class="fail">CORS blocked</span><br>' +
         '<span class="info">The GitLab API did not return CORS headers for this origin.<br>' +
         'Origin: ' + esc(window.location.origin) + '<br>' +
         'Target: ' + esc(gl) + '</span><br>' +
         '<span class="warn">All subsequent tests will likely also fail.</span>', 'fail');
     } else {
-      addStep('Test 1 — User identity',
+      addStep('Test 1 \u2014 User identity',
         '<span class="fail">HTTP ' + r.status + '</span><br>' +
         '<span class="info">Auth method: ' + esc(r.method) + '</span><br>' +
         '<pre>' + esc((r.data || '').substring(0, 500)) + '</pre>', 'fail');
@@ -255,15 +314,15 @@ async function doTests() {
       const files = JSON.parse(r.data);
       const listing = files.map(f =>
         (f.type === 'tree' ? '\uD83D\uDCC1 ' : '\uD83D\uDCC4 ') + f.name).join('\n');
-      addStep('Test 2 — List repository root  (' + files.length + ' items)',
+      addStep('Test 2 \u2014 List repository root  (' + files.length + ' items)',
         '<span class="ok">Success</span> ' +
         '<span class="info">via ' + esc(r.method) + '</span>' +
         '<pre>' + esc(listing) + '</pre>', 'pass');
     } else if (r.corsBlocked) {
-      addStep('Test 2 — List repository root',
+      addStep('Test 2 \u2014 List repository root',
         '<span class="fail">CORS blocked (' + esc(r.error || '') + ')</span>', 'fail');
     } else {
-      addStep('Test 2 — List repository root',
+      addStep('Test 2 \u2014 List repository root',
         '<span class="fail">HTTP ' + r.status + '</span>' +
         '<pre>' + esc((r.data || '').substring(0, 500)) + '</pre>', 'fail');
     }
@@ -276,15 +335,15 @@ async function doTests() {
                 encodeURIComponent(filePath) + '/raw?ref=' + ref;
     const r = await apiFetch(url, token);
     if (r.ok) {
-      addStep('Test 3 — Fetch file: ' + filePath,
+      addStep('Test 3 \u2014 Fetch file: ' + filePath,
         '<span class="ok">Success</span> (' + r.data.length + ' bytes) ' +
         '<span class="info">via ' + esc(r.method) + '</span>' +
         '<pre>' + esc(r.data.substring(0, 1500)) + '</pre>', 'pass');
     } else if (r.corsBlocked) {
-      addStep('Test 3 — Fetch file: ' + filePath,
+      addStep('Test 3 \u2014 Fetch file: ' + filePath,
         '<span class="fail">CORS blocked</span>', 'fail');
     } else {
-      addStep('Test 3 — Fetch file: ' + filePath,
+      addStep('Test 3 \u2014 Fetch file: ' + filePath,
         '<span class="fail">HTTP ' + r.status + '</span>' +
         '<pre>' + esc((r.data || '').substring(0, 500)) + '</pre>', 'fail');
     }
@@ -298,23 +357,23 @@ async function doTests() {
     if (r.ok) {
       const files = JSON.parse(r.data);
       if (files.length === 0) {
-        addStep('Test 4 — List data/ directory',
+        addStep('Test 4 \u2014 List data/ directory',
           '<span class="warn">Directory is empty or does not exist</span>', 'wait');
       } else {
         const listing = files.map(f =>
           (f.type === 'tree' ? '\uD83D\uDCC1 ' : '\uD83D\uDCC4 ') + f.name).join('\n');
-        addStep('Test 4 — List data/ directory (' + files.length + ' items)',
+        addStep('Test 4 \u2014 List data/ directory (' + files.length + ' items)',
           '<span class="ok">Success</span>' +
           '<pre>' + esc(listing) + '</pre>', 'pass');
       }
     } else if (r.status === 404) {
-      addStep('Test 4 — List data/ directory',
-        '<span class="warn">No data/ directory found (HTTP 404) — that\'s fine for this test</span>', 'wait');
+      addStep('Test 4 \u2014 List data/ directory',
+        '<span class="warn">No data/ directory found (HTTP 404) \u2014 fine for this test</span>', 'wait');
     } else if (r.corsBlocked) {
-      addStep('Test 4 — List data/ directory',
+      addStep('Test 4 \u2014 List data/ directory',
         '<span class="fail">CORS blocked</span>', 'fail');
     } else {
-      addStep('Test 4 — List data/ directory',
+      addStep('Test 4 \u2014 List data/ directory',
         '<span class="fail">HTTP ' + r.status + '</span>', 'fail');
     }
   }
@@ -333,6 +392,7 @@ async function doTests() {
 function clearAll() {
   sessionStorage.removeItem('oauth_token');
   sessionStorage.removeItem('oauth_state');
+  sessionStorage.removeItem('oauth_code_verifier');
   sessionStorage.removeItem('oauth_redirect_uri');
   $('results').innerHTML = '';
   $('btn-test').disabled = true;
@@ -342,7 +402,7 @@ function clearAll() {
 /* ------------------------------------------------------------------ */
 /*  Init — restore config, handle OAuth callback                       */
 /* ------------------------------------------------------------------ */
-(function init() {
+(async function init() {
   loadConfig();
 
   // Check for existing token
@@ -353,8 +413,8 @@ function clearAll() {
       '<span class="info">Using token from previous login. Click <b>Clear</b> to reset.</span>', '');
   }
 
-  // Handle OAuth implicit-grant callback (token in URL fragment)
-  handleImplicitCallback();
+  // Handle Authorization Code callback (?code=...&state=...)
+  await handleCodeCallback();
 })();
 </script>
 </body>
