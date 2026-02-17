@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>GitLab OAuth Smoke Test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 820px; margin: 2em auto; padding: 0 1em; line-height: 1.6; }
+  h1 { margin-bottom: 0.3em; }
+  p.subtitle { color: #586069; margin-top: 0; }
+  fieldset { border: 1px solid #d1d5da; border-radius: 6px; padding: 1em 1.2em; margin-bottom: 1.5em; }
+  label { display: block; margin-top: 0.6em; font-weight: 600; font-size: 0.95em; }
+  input { width: 100%; padding: 0.4em 0.5em; font-size: 0.95em; box-sizing: border-box;
+          border: 1px solid #d1d5da; border-radius: 4px; }
+  button { padding: 0.5em 1.5em; font-size: 1em; cursor: pointer; border-radius: 4px;
+           border: 1px solid #d1d5da; background: #fafbfc; margin: 0.5em 0.5em 0.5em 0; }
+  button:hover:not(:disabled) { background: #f3f4f6; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: #2f80ed; color: #fff; border-color: #2f80ed; }
+  button.primary:hover:not(:disabled) { background: #1a6dd4; }
+  .step { border-left: 3px solid #e1e4e8; padding: 0.5em 0 0.5em 1em; margin: 0.8em 0; }
+  .step h3 { margin: 0 0 0.3em; font-size: 1em; }
+  .step.pass { border-left-color: #28a745; }
+  .step.fail { border-left-color: #cb2431; }
+  .step.wait { border-left-color: #dbab09; }
+  .ok { color: #22863a; }
+  .fail { color: #cb2431; }
+  .warn { color: #b08800; }
+  .info { color: #586069; }
+  .mono { font-family: SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+  pre { background: #f6f8fa; padding: 0.8em 1em; overflow-x: auto; border-radius: 4px;
+        font-size: 0.85em; max-height: 20em; overflow-y: auto; margin: 0.4em 0; }
+  #results > .step { animation: fadeIn 0.2s ease-in; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+</style>
+</head>
+<body>
+
+<h1>GitLab OAuth Smoke Test</h1>
+<p class="subtitle">Verifies OAuth login + cross-origin API access to private repo files.</p>
+
+<fieldset>
+  <legend>Configuration</legend>
+  <label>GitLab instance URL</label>
+  <input id="cfg-gitlab" value="https://cee-gitlab.sandia.gov" />
+
+  <label>OAuth Application ID <span class="info">(from User Settings &rarr; Applications)</span></label>
+  <input id="cfg-clientid" placeholder="e.g. a1b2c3d4e5f6..." />
+
+  <label>Private project ID to test</label>
+  <input id="cfg-project" value="58961" />
+
+  <label>Branch / ref</label>
+  <input id="cfg-ref" value="main" />
+</fieldset>
+
+<div>
+  <button class="primary" onclick="doLogin()" id="btn-login">Step 1 &mdash; Login with GitLab</button>
+  <button onclick="doTests()" id="btn-test" disabled>Step 2 &mdash; Test API Access</button>
+  <button onclick="clearAll()" style="float:right;">Clear</button>
+</div>
+
+<div id="results"></div>
+
+<script>
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function addStep(title, body, status) {
+  const div = document.createElement('div');
+  div.className = 'step ' + (status || '');
+  div.innerHTML = '<h3>' + title + '</h3>' + body;
+  $('results').appendChild(div);
+  div.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  return div;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Config persistence (survives the OAuth redirect)                   */
+/* ------------------------------------------------------------------ */
+function saveConfig() {
+  const cfg = {
+    gitlab:   $('cfg-gitlab').value.replace(/\/+$/, ''),
+    clientId: $('cfg-clientid').value.trim(),
+    project:  $('cfg-project').value.trim(),
+    ref:      $('cfg-ref').value.trim() || 'main',
+  };
+  sessionStorage.setItem('oauth_cfg', JSON.stringify(cfg));
+  return cfg;
+}
+function loadConfig() {
+  try {
+    const s = sessionStorage.getItem('oauth_cfg');
+    if (!s) return null;
+    const c = JSON.parse(s);
+    $('cfg-gitlab').value   = c.gitlab   || '';
+    $('cfg-clientid').value = c.clientId  || '';
+    $('cfg-project').value  = c.project   || '';
+    $('cfg-ref').value      = c.ref       || 'main';
+    return c;
+  } catch { return null; }
+}
+
+/* ------------------------------------------------------------------ */
+/*  OAuth — Implicit Grant (works over plain HTTP, no crypto.subtle)   */
+/* ------------------------------------------------------------------ */
+function randomState() {
+  const a = new Uint8Array(20);
+  crypto.getRandomValues(a);
+  return Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function doLogin() {
+  const cfg = saveConfig();
+  if (!cfg.clientId) { alert('Enter your OAuth Application ID first.'); return; }
+
+  const state = randomState();
+  sessionStorage.setItem('oauth_state', state);
+
+  // redirect_uri must exactly match one registered in the OAuth app
+  const redirectUri = window.location.href.split('?')[0].split('#')[0];
+  sessionStorage.setItem('oauth_redirect_uri', redirectUri);
+
+  const params = new URLSearchParams({
+    client_id:     cfg.clientId,
+    redirect_uri:  redirectUri,
+    response_type: 'token',        // Implicit Grant
+    scope:         'read_api',
+    state:         state,
+  });
+
+  addStep('Redirecting to GitLab&hellip;',
+    '<span class="info mono">' + esc(cfg.gitlab + '/oauth/authorize') + '</span>', 'wait');
+
+  window.location.href = cfg.gitlab + '/oauth/authorize?' + params;
+}
+
+/* Parse the #access_token=...&state=... fragment on callback */
+function handleImplicitCallback() {
+  const hash = window.location.hash.substring(1);   // strip leading #
+  if (!hash) return false;
+
+  const p = new URLSearchParams(hash);
+  const token = p.get('access_token');
+  const state = p.get('state');
+  if (!token) return false;
+
+  // Clean the hash immediately (don't leak token in address bar / history)
+  history.replaceState(null, '', window.location.pathname + window.location.search);
+
+  // Verify state
+  const saved = sessionStorage.getItem('oauth_state');
+  if (state !== saved) {
+    addStep('OAuth callback — state mismatch',
+      '<span class="fail">Expected: ' + esc(saved || '(none)') +
+      '<br>Got: ' + esc(state || '(none)') + '</span>', 'fail');
+    return true;
+  }
+
+  const expiresIn = p.get('expires_in') || '?';
+  const tokenType = p.get('token_type') || '?';
+  sessionStorage.setItem('oauth_token', token);
+
+  addStep('OAuth login successful',
+    '<span class="ok">Token received</span><br>' +
+    '<span class="info">Type: ' + esc(tokenType) +
+    ' &nbsp;|&nbsp; Expires in: ' + esc(expiresIn) + 's' +
+    ' &nbsp;|&nbsp; Token: ' + esc(token.substring(0, 8)) + '&hellip;</span>', 'pass');
+
+  $('btn-test').disabled = false;
+  $('btn-login').textContent = 'Step 1 — Logged in \u2713';
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
+/*  API fetch helper — tries Authorization header, then query param   */
+/* ------------------------------------------------------------------ */
+async function apiFetch(url, token) {
+  const methods = [
+    { label: 'Authorization: Bearer header',
+      opts: { headers: { 'Authorization': 'Bearer ' + token } } },
+    { label: 'access_token query parameter',
+      opts: {},
+      urlSuffix: (url.includes('?') ? '&' : '?') + 'access_token=' + token },
+  ];
+
+  for (const m of methods) {
+    const fullUrl = url + (m.urlSuffix || '');
+    try {
+      const resp = await fetch(fullUrl, m.opts);
+      const cors = resp.headers.get('access-control-allow-origin');
+      if (resp.ok) {
+        return { ok: true, method: m.label, status: resp.status,
+                 cors, data: await resp.text() };
+      }
+      // non-2xx but we got a response (CORS allowed, auth/permission failed)
+      return { ok: false, method: m.label, status: resp.status,
+               cors, data: await resp.text() };
+    } catch (err) {
+      // fetch() throws on network error or CORS block
+      if (m === methods[methods.length - 1]) {
+        return { ok: false, method: 'all methods', error: err.message,
+                 corsBlocked: true };
+      }
+      // try next method
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Test suite                                                         */
+/* ------------------------------------------------------------------ */
+async function doTests() {
+  const cfg = loadConfig();
+  const token = sessionStorage.getItem('oauth_token');
+  if (!token) { alert('Login first.'); return; }
+
+  $('btn-test').disabled = true;
+
+  const gl = cfg.gitlab;
+  const pid = cfg.project;
+  const ref = cfg.ref;
+
+  // ---- Test 1: User info (simplest API call) ---- //
+  {
+    const url = gl + '/api/v4/user';
+    const r = await apiFetch(url, token);
+    if (r.ok) {
+      const u = JSON.parse(r.data);
+      addStep('Test 1 — User identity',
+        '<span class="ok">Authenticated as: ' + esc(u.username || u.name) + '</span><br>' +
+        '<span class="info">Auth method: ' + esc(r.method) + '</span>', 'pass');
+    } else if (r.corsBlocked) {
+      addStep('Test 1 — User identity',
+        '<span class="fail">CORS blocked</span><br>' +
+        '<span class="info">The GitLab API did not return CORS headers for this origin.<br>' +
+        'Origin: ' + esc(window.location.origin) + '<br>' +
+        'Target: ' + esc(gl) + '</span><br>' +
+        '<span class="warn">All subsequent tests will likely also fail.</span>', 'fail');
+    } else {
+      addStep('Test 1 — User identity',
+        '<span class="fail">HTTP ' + r.status + '</span><br>' +
+        '<span class="info">Auth method: ' + esc(r.method) + '</span><br>' +
+        '<pre>' + esc((r.data || '').substring(0, 500)) + '</pre>', 'fail');
+    }
+  }
+
+  // ---- Test 2: Repository tree ---- //
+  {
+    const url = gl + '/api/v4/projects/' + pid + '/repository/tree?ref=' + ref + '&per_page=100';
+    const r = await apiFetch(url, token);
+    if (r.ok) {
+      const files = JSON.parse(r.data);
+      const listing = files.map(f =>
+        (f.type === 'tree' ? '\uD83D\uDCC1 ' : '\uD83D\uDCC4 ') + f.name).join('\n');
+      addStep('Test 2 — List repository root  (' + files.length + ' items)',
+        '<span class="ok">Success</span> ' +
+        '<span class="info">via ' + esc(r.method) + '</span>' +
+        '<pre>' + esc(listing) + '</pre>', 'pass');
+    } else if (r.corsBlocked) {
+      addStep('Test 2 — List repository root',
+        '<span class="fail">CORS blocked (' + esc(r.error || '') + ')</span>', 'fail');
+    } else {
+      addStep('Test 2 — List repository root',
+        '<span class="fail">HTTP ' + r.status + '</span>' +
+        '<pre>' + esc((r.data || '').substring(0, 500)) + '</pre>', 'fail');
+    }
+  }
+
+  // ---- Test 3: Fetch a specific file ---- //
+  {
+    const filePath = 'README.md';
+    const url = gl + '/api/v4/projects/' + pid + '/repository/files/' +
+                encodeURIComponent(filePath) + '/raw?ref=' + ref;
+    const r = await apiFetch(url, token);
+    if (r.ok) {
+      addStep('Test 3 — Fetch file: ' + filePath,
+        '<span class="ok">Success</span> (' + r.data.length + ' bytes) ' +
+        '<span class="info">via ' + esc(r.method) + '</span>' +
+        '<pre>' + esc(r.data.substring(0, 1500)) + '</pre>', 'pass');
+    } else if (r.corsBlocked) {
+      addStep('Test 3 — Fetch file: ' + filePath,
+        '<span class="fail">CORS blocked</span>', 'fail');
+    } else {
+      addStep('Test 3 — Fetch file: ' + filePath,
+        '<span class="fail">HTTP ' + r.status + '</span>' +
+        '<pre>' + esc((r.data || '').substring(0, 500)) + '</pre>', 'fail');
+    }
+  }
+
+  // ---- Test 4: List data/ directory ---- //
+  {
+    const url = gl + '/api/v4/projects/' + pid + '/repository/tree?ref=' + ref +
+                '&path=data&per_page=100';
+    const r = await apiFetch(url, token);
+    if (r.ok) {
+      const files = JSON.parse(r.data);
+      if (files.length === 0) {
+        addStep('Test 4 — List data/ directory',
+          '<span class="warn">Directory is empty or does not exist</span>', 'wait');
+      } else {
+        const listing = files.map(f =>
+          (f.type === 'tree' ? '\uD83D\uDCC1 ' : '\uD83D\uDCC4 ') + f.name).join('\n');
+        addStep('Test 4 — List data/ directory (' + files.length + ' items)',
+          '<span class="ok">Success</span>' +
+          '<pre>' + esc(listing) + '</pre>', 'pass');
+      }
+    } else if (r.status === 404) {
+      addStep('Test 4 — List data/ directory',
+        '<span class="warn">No data/ directory found (HTTP 404) — that\'s fine for this test</span>', 'wait');
+    } else if (r.corsBlocked) {
+      addStep('Test 4 — List data/ directory',
+        '<span class="fail">CORS blocked</span>', 'fail');
+    } else {
+      addStep('Test 4 — List data/ directory',
+        '<span class="fail">HTTP ' + r.status + '</span>', 'fail');
+    }
+  }
+
+  // ---- Summary ---- //
+  addStep('Done',
+    '<span class="info">If tests 1\u20133 passed, the OAuth approach works and we can proceed ' +
+    'with the full implementation.</span>', '');
+
+  $('btn-test').disabled = false;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Clear                                                              */
+/* ------------------------------------------------------------------ */
+function clearAll() {
+  sessionStorage.removeItem('oauth_token');
+  sessionStorage.removeItem('oauth_state');
+  sessionStorage.removeItem('oauth_redirect_uri');
+  $('results').innerHTML = '';
+  $('btn-test').disabled = true;
+  $('btn-login').textContent = 'Step 1 \u2014 Login with GitLab';
+}
+
+/* ------------------------------------------------------------------ */
+/*  Init — restore config, handle OAuth callback                       */
+/* ------------------------------------------------------------------ */
+(function init() {
+  loadConfig();
+
+  // Check for existing token
+  if (sessionStorage.getItem('oauth_token')) {
+    $('btn-test').disabled = false;
+    $('btn-login').textContent = 'Step 1 \u2014 Logged in \u2713';
+    addStep('Session restored',
+      '<span class="info">Using token from previous login. Click <b>Clear</b> to reset.</span>', '');
+  }
+
+  // Handle OAuth implicit-grant callback (token in URL fragment)
+  handleImplicitCallback();
+})();
+</script>
+</body>
+</html>

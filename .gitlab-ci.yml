@@ -54,6 +54,7 @@ build:
     - MARIMO_VERSION=$(python -c "import re; print(re.search(r'MARIMO_VERSION = \"([^\"]+)\"', open('scripts/build.py').read()).group(1))")
     - pip install "marimo==$MARIMO_VERSION" packaging
     - python scripts/build.py --mode edit --slim
+    - cp oauth-test.html _site/
   artifacts:
     paths:
       - _site
