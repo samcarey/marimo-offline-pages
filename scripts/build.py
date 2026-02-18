@@ -2405,7 +2405,7 @@ def inject_repo_file_loader(output_dir):
             "+'del _c,_f,_u,_r,_d,_p\\n';"
             f"await {instance_var}.runPythonAsync(_py);"
             "indexedDB.deleteDatabase('_marimo_launcher');"
-            "}catch(e){}"
+            "}catch(e){console.error('[marimo-launcher] data file load failed:',e)}"
             "})();"
         )
 

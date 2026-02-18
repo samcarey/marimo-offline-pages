@@ -322,6 +322,7 @@ async function launch() {
   } catch (e) {
     dataFiles = [];
   }
+  console.log('[marimo-launcher] data files found:', dataFiles);
 
   // Store notebook code in localStorage (sync read by index.html)
   setStatus('Preparing launch&hellip;');
