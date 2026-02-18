@@ -2436,6 +2436,24 @@ def patch_index_for_launcher(output_dir):
 
         insert_pos = idx + len(marker)
         text = text[:insert_pos] + "\n      " + launcher_js + text[insert_pos:]
+
+        # Add BroadcastChannel listener to auto-refresh file explorer
+        # after the worker finishes loading data files.
+        refresh_script = (
+            '\n<script>'
+            'try{var _bc=new BroadcastChannel("_marimo_launcher");'
+            '_bc.onmessage=function(){_bc.close();'
+            'setTimeout(function(){'
+            'var b=document.querySelector("[data-testid=\\"file-explorer-refresh-button\\"]");'
+            'if(b)b.click();'
+            '},500)};'
+            '}catch(e){}'
+            '</script>'
+        )
+        body_end = text.rfind('</body>')
+        if body_end != -1:
+            text = text[:body_end] + refresh_script + text[body_end:]
+
         path.write_text(text)
         patched += 1
         print(f"  ✓ Injected launcher check: {path}")
@@ -2513,6 +2531,7 @@ def inject_repo_file_loader(output_dir):
             "+'del _c,_f,_u,_r,_d,_p\\n';"
             f'await {instance_var}["runPythonAsync"](_py);'
             "console.log('[marimo-launcher] data files loaded successfully');"
+            "try{new BroadcastChannel('_marimo_launcher').postMessage('done')}catch(e){}"
             "}catch(e){console.error('[marimo-launcher] data file load failed:',e)}"
             "})();"
         )
