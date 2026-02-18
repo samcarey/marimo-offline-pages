@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Launching notebook&hellip;</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 520px; margin: 4em auto; padding: 0 1em; text-align: center; color: #24292e; }
+  h1 { font-size: 1.4em; margin-bottom: 0.3em; }
+  .status { color: #586069; margin: 1.5em 0; min-height: 1.6em; }
+  .spinner { display: inline-block; width: 1.2em; height: 1.2em; border: 2px solid #d1d5da;
+             border-top-color: #2f80ed; border-radius: 50%; animation: spin 0.7s linear infinite;
+             vertical-align: middle; margin-right: 0.4em; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .error { color: #cb2431; text-align: left; background: #ffeef0; padding: 1em; border-radius: 6px; margin: 1em 0; }
+  .error code { font-size: 0.9em; }
+  a { color: #2f80ed; }
+</style>
+</head>
+<body>
+
+<h1>marimo Notebook Launcher</h1>
+<div class="status" id="status"><span class="spinner"></span>Initializing&hellip;</div>
+<div id="error-box"></div>
+
+<script>
+/* ------------------------------------------------------------------ */
+/*  Configuration (replaced at build time by build.py)                 */
+/* ------------------------------------------------------------------ */
+var OAUTH_CLIENT_ID = '__OAUTH_CLIENT_ID__';
+var GITLAB_URL      = '__GITLAB_URL__';
+
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
+var statusEl = document.getElementById('status');
+var errorEl  = document.getElementById('error-box');
+
+function setStatus(msg) {
+  statusEl.innerHTML = '<span class="spinner"></span>' + msg;
+}
+
+function showError(msg) {
+  statusEl.textContent = '';
+  errorEl.innerHTML = '<div class="error">' + msg + '</div>';
+}
+
+function randomHex(len) {
+  var a = new Uint8Array(len);
+  crypto.getRandomValues(a);
+  return Array.from(a, function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+}
+
+/* ------------------------------------------------------------------ */
+/*  URL parameters                                                     */
+/* ------------------------------------------------------------------ */
+var params   = new URLSearchParams(window.location.search);
+var PROJECT  = params.get('project');
+var REF      = params.get('ref') || 'main';
+var NOTEBOOK = params.get('notebook');          // optional override
+var DATA_PATH = params.get('data_path') || 'data';
+
+/* ------------------------------------------------------------------ */
+/*  Token management — persists in localStorage                        */
+/* ------------------------------------------------------------------ */
+var TOKEN_KEY = '_marimo_oauth_token';
+
+function getToken() { return localStorage.getItem(TOKEN_KEY); }
+function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }
+
+async function validateToken(token) {
+  try {
+    var resp = await fetch(GITLAB_URL + '/api/v4/user', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    return resp.ok;
+  } catch (e) { return false; }
+}
+
+/* ------------------------------------------------------------------ */
+/*  OAuth — Authorization Code + PKCE (plain)                          */
+/* ------------------------------------------------------------------ */
+function startOAuth() {
+  var state = randomHex(20);
+  var codeVerifier = randomHex(32);
+
+  sessionStorage.setItem('_launch_oauth_state', state);
+  sessionStorage.setItem('_launch_oauth_verifier', codeVerifier);
+  // Preserve launch params across redirect
+  sessionStorage.setItem('_launch_params', window.location.search);
+
+  var redirectUri = window.location.href.split('?')[0].split('#')[0];
+  sessionStorage.setItem('_launch_redirect_uri', redirectUri);
+
+  var authParams = new URLSearchParams({
+    client_id:             OAUTH_CLIENT_ID,
+    redirect_uri:          redirectUri,
+    response_type:         'code',
+    scope:                 'read_api',
+    state:                 state,
+    code_challenge:        codeVerifier,
+    code_challenge_method: 'plain',
+  });
+
+  window.location.href = GITLAB_URL + '/oauth/authorize?' + authParams;
+}
+
+async function handleOAuthCallback() {
+  var cbParams = new URLSearchParams(window.location.search);
+  var code = cbParams.get('code');
+  var state = cbParams.get('state');
+  if (!code) return false;
+
+  // Clean URL
+  history.replaceState(null, '', window.location.pathname +
+    (sessionStorage.getItem('_launch_params') || ''));
+
+  // Restore launch params
+  var restored = sessionStorage.getItem('_launch_params');
+  if (restored) {
+    var rp = new URLSearchParams(restored);
+    if (!PROJECT) PROJECT = rp.get('project');
+    if (REF === 'main' && rp.get('ref')) REF = rp.get('ref');
+    if (!NOTEBOOK) NOTEBOOK = rp.get('notebook');
+    if (DATA_PATH === 'data' && rp.get('data_path')) DATA_PATH = rp.get('data_path');
+  }
+
+  // Verify state
+  var savedState = sessionStorage.getItem('_launch_oauth_state');
+  if (state !== savedState) {
+    showError('OAuth state mismatch. Please try again.');
+    return true;
+  }
+
+  setStatus('Exchanging authorization code&hellip;');
+
+  var codeVerifier = sessionStorage.getItem('_launch_oauth_verifier');
+  var redirectUri = sessionStorage.getItem('_launch_redirect_uri');
+
+  var body = new URLSearchParams({
+    client_id:     OAUTH_CLIENT_ID,
+    code:          code,
+    grant_type:    'authorization_code',
+    redirect_uri:  redirectUri,
+    code_verifier: codeVerifier,
+  });
+
+  try {
+    var resp = await fetch(GITLAB_URL + '/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body,
+    });
+    if (!resp.ok) {
+      var errText = await resp.text();
+      showError('Token exchange failed (HTTP ' + resp.status + '). ' +
+        '<code>' + errText.substring(0, 200) + '</code>');
+      return true;
+    }
+    var data = await resp.json();
+    setToken(data.access_token);
+  } catch (err) {
+    showError('Token exchange error: ' + err.message);
+    return true;
+  }
+
+  // Clean up session storage
+  sessionStorage.removeItem('_launch_oauth_state');
+  sessionStorage.removeItem('_launch_oauth_verifier');
+  sessionStorage.removeItem('_launch_redirect_uri');
+  sessionStorage.removeItem('_launch_params');
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
+/*  GitLab API helpers                                                 */
+/* ------------------------------------------------------------------ */
+async function gitlabGet(path) {
+  var token = getToken();
+  var resp = await fetch(GITLAB_URL + path, {
+    headers: { 'Authorization': 'Bearer ' + token }
+  });
+  if (resp.status === 401) {
+    // Token expired — re-auth
+    localStorage.removeItem(TOKEN_KEY);
+    startOAuth();
+    throw new Error('Token expired, re-authenticating...');
+  }
+  if (!resp.ok) throw new Error('GitLab API error: HTTP ' + resp.status + ' on ' + path);
+  return resp;
+}
+
+async function gitlabGetJSON(path) {
+  var resp = await gitlabGet(path);
+  return resp.json();
+}
+
+async function gitlabGetText(path) {
+  var resp = await gitlabGet(path);
+  return resp.text();
+}
+
+/* ------------------------------------------------------------------ */
+/*  File discovery                                                     */
+/* ------------------------------------------------------------------ */
+async function findNotebook() {
+  if (NOTEBOOK) return NOTEBOOK;
+
+  // List repo root
+  var tree = await gitlabGetJSON(
+    '/api/v4/projects/' + PROJECT + '/repository/tree?ref=' + REF + '&per_page=100'
+  );
+  // Look for notebook.py by convention, then any .py file
+  var pyFiles = tree.filter(function(f) { return f.type === 'blob' && f.name.endsWith('.py'); });
+
+  var byConvention = pyFiles.find(function(f) { return f.name === 'notebook.py'; });
+  if (byConvention) return byConvention.name;
+
+  if (pyFiles.length === 1) return pyFiles[0].name;
+  if (pyFiles.length > 1) {
+    // Prefer files with 'notebook' in the name
+    var nbFile = pyFiles.find(function(f) { return f.name.toLowerCase().indexOf('notebook') !== -1; });
+    if (nbFile) return nbFile.name;
+    return pyFiles[0].name;
+  }
+
+  throw new Error('No .py notebook found in repository root');
+}
+
+async function listDataFiles(dataPath) {
+  try {
+    var tree = await gitlabGetJSON(
+      '/api/v4/projects/' + PROJECT + '/repository/tree?ref=' + REF +
+      '&path=' + encodeURIComponent(dataPath) + '&per_page=100&recursive=true'
+    );
+    return tree
+      .filter(function(f) { return f.type === 'blob'; })
+      .map(function(f) { return f.path; });
+  } catch (e) {
+    // No data directory is fine
+    return [];
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  IndexedDB helper                                                   */
+/* ------------------------------------------------------------------ */
+function idbStore(config) {
+  return new Promise(function(resolve, reject) {
+    var req = indexedDB.open('_marimo_launcher', 1);
+    req.onupgradeneeded = function() {
+      req.result.createObjectStore('config');
+    };
+    req.onsuccess = function() {
+      var db = req.result;
+      var tx = db.transaction('config', 'readwrite');
+      tx.objectStore('config').put(config, 'pending');
+      tx.oncomplete = function() { db.close(); resolve(); };
+      tx.onerror = function() { db.close(); reject(tx.error); };
+    };
+    req.onerror = function() { reject(req.error); };
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main launch flow                                                   */
+/* ------------------------------------------------------------------ */
+async function launch() {
+  // Handle OAuth callback first
+  var wasCallback = await handleOAuthCallback();
+
+  if (!PROJECT) {
+    showError('Missing <code>?project=ID</code> parameter.<br>' +
+      'Usage: <code>launch.html?project=12345</code>');
+    return;
+  }
+
+  // Check for valid token
+  var token = getToken();
+  if (token) {
+    setStatus('Verifying authentication&hellip;');
+    var valid = await validateToken(token);
+    if (!valid) {
+      localStorage.removeItem(TOKEN_KEY);
+      token = null;
+    }
+  }
+
+  if (!token) {
+    setStatus('Redirecting to GitLab login&hellip;');
+    startOAuth();
+    return;
+  }
+
+  // Fetch notebook
+  setStatus('Discovering notebook&hellip;');
+  var notebookPath;
+  try {
+    notebookPath = await findNotebook();
+  } catch (e) {
+    showError('Could not find notebook: ' + e.message);
+    return;
+  }
+
+  setStatus('Fetching <b>' + notebookPath + '</b>&hellip;');
+  var notebookCode;
+  try {
+    notebookCode = await gitlabGetText(
+      '/api/v4/projects/' + PROJECT + '/repository/files/' +
+      encodeURIComponent(notebookPath) + '/raw?ref=' + REF
+    );
+  } catch (e) {
+    showError('Could not fetch notebook: ' + e.message);
+    return;
+  }
+
+  // Discover data files
+  setStatus('Discovering data files&hellip;');
+  var dataFiles;
+  try {
+    dataFiles = await listDataFiles(DATA_PATH);
+  } catch (e) {
+    dataFiles = [];
+  }
+
+  // Store notebook code in localStorage (sync read by index.html)
+  setStatus('Preparing launch&hellip;');
+  localStorage.setItem('_marimo_notebook', notebookCode);
+
+  // Store data file config in IndexedDB (read by worker)
+  if (dataFiles.length > 0) {
+    try {
+      await idbStore({
+        token:   getToken(),
+        gitlab:  GITLAB_URL,
+        project: PROJECT,
+        ref:     REF,
+        files:   dataFiles,
+      });
+    } catch (e) {
+      showError('Could not store data file config: ' + e.message);
+      return;
+    }
+  }
+
+  // Redirect to the notebook
+  setStatus('Launching notebook&hellip;');
+  window.location.href = 'index.html';
+}
+
+/* ------------------------------------------------------------------ */
+/*  Start                                                              */
+/* ------------------------------------------------------------------ */
+launch().catch(function(err) {
+  showError('Unexpected error: ' + err.message);
+});
+</script>
+</body>
+</html>

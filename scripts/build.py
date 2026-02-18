@@ -2174,6 +2174,194 @@ def _detect_marimo_version():
     return MARIMO_VERSION
 
 
+# ---------------------------------------------------------------------------
+# Launch page: OAuth + GitLab API → load notebooks from private repos
+# ---------------------------------------------------------------------------
+
+def _get_oauth_config():
+    """Read [oauth] client-id and gitlab-url from pip.conf.
+
+    Returns ``(client_id, gitlab_url)`` or ``(None, None)`` if not configured.
+    """
+    pip_conf = Path("pip.conf")
+    if not pip_conf.exists():
+        return None, None
+    cfg = configparser.ConfigParser()
+    cfg.read(pip_conf)
+    client_id = cfg.get("oauth", "client-id", fallback=None)
+    gitlab_url = cfg.get("oauth", "gitlab-url", fallback=None)
+    if client_id:
+        client_id = client_id.strip()
+    if gitlab_url:
+        gitlab_url = gitlab_url.strip().rstrip("/")
+    return client_id, gitlab_url
+
+
+def build_launch_page(output_dir):
+    """Generate launch.html with OAuth config baked in (opt-in).
+
+    Reads ``[oauth] client-id`` and ``[oauth] gitlab-url`` from pip.conf and
+    replaces placeholders in the launch.html template.  If not configured the
+    step is silently skipped.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 12: Building launch page (opt-in)")
+    print("══════════════════════════════════════════")
+
+    client_id, gitlab_url = _get_oauth_config()
+    if not client_id or not gitlab_url:
+        print("  ℹ [oauth] client-id / gitlab-url not set in pip.conf — skipping")
+        return
+
+    template = Path("launch.html")
+    if not template.exists():
+        print("  ⚠ launch.html template not found at repo root — skipping")
+        return
+
+    html = template.read_text()
+    html = html.replace("__OAUTH_CLIENT_ID__", client_id)
+    html = html.replace("__GITLAB_URL__", gitlab_url)
+
+    dest = Path(output_dir) / "launch.html"
+    dest.write_text(html)
+    print(f"  ✓ launch.html generated with client_id={client_id[:8]}…")
+    print(f"    gitlab_url={gitlab_url}")
+
+
+def patch_index_for_launcher(output_dir):
+    """Extend the inline share-handler script to load notebooks from launch.html.
+
+    When launch.html stores notebook code in ``localStorage._marimo_notebook``,
+    this patch reads it, injects it into ``<marimo-code>``, and clears storage.
+    The check runs before the existing ``#code/`` hash check.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 11b: Patching index.html for launcher")
+    print("══════════════════════════════════════════")
+
+    launcher_js = (
+        "// --- Launcher: load notebook from launch.html ---\n"
+        "      var _lc=localStorage.getItem('_marimo_notebook');\n"
+        "      if(_lc){\n"
+        "        localStorage.removeItem('_marimo_notebook');\n"
+        "        var _el=document.querySelector('marimo-code');\n"
+        "        if(_el){_el.textContent=encodeURIComponent(_lc);}\n"
+        "        return;\n"
+        "      }\n"
+    )
+
+    patched = 0
+    for path in Path(output_dir).rglob("index.html"):
+        text = path.read_text(errors="ignore")
+        if 'data-marimo-share' not in text:
+            continue  # Not a notebook page
+        if '_marimo_notebook' in text:
+            patched += 1
+            print(f"  ✓ Launcher check already present: {path}")
+            continue
+
+        # Insert at the top of the IIFE, right after (function(){
+        marker = '<script data-marimo-share="true">\n    (function(){'
+        idx = text.find(marker)
+        if idx == -1:
+            patch_error("launcher-index",
+                        f"Could not find share IIFE in {path}")
+            continue
+
+        insert_pos = idx + len(marker)
+        text = text[:insert_pos] + "\n      " + launcher_js + text[insert_pos:]
+        path.write_text(text)
+        patched += 1
+        print(f"  ✓ Injected launcher check: {path}")
+
+    if patched == 0:
+        print("  ⚠ No index.html files had the share script to patch")
+    else:
+        print(f"  ✓ Patched {patched} index.html files")
+
+
+def inject_repo_file_loader(output_dir):
+    """Inject data-file fetcher into worker JS for launch.html support.
+
+    Reads data file config from IndexedDB (stored by launch.html), fetches
+    each file from the GitLab API using ``pyfetch`` with Bearer auth, and
+    writes them to the Pyodide filesystem before the notebook executes.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 11c: Injecting repo file loader into worker JS")
+    print("══════════════════════════════════════════")
+
+    patched = 0
+    for path in Path(output_dir).rglob("*worker*.js"):
+        if "pyodide" in str(path):
+            continue
+        text = path.read_text(errors="ignore")
+
+        if '_marimo_launcher' in text:
+            patched += 1
+            print(f"  ✓ Repo file loader already present: {path}")
+            continue
+
+        # Find the Pyodide instance variable from .runPythonAsync(
+        m = re.search(r'(\w+)\.runPythonAsync\(', text)
+        if not m:
+            continue
+
+        instance_var = m.group(1)
+
+        # Build the injection: read IndexedDB, fetch files via pyfetch, clean up.
+        # The injected JS reads config from IndexedDB at runtime, builds a
+        # Python script string dynamically, and runs it via runPythonAsync.
+        # We use \x27 for single quotes inside JS strings to avoid escaping hell.
+        injection = (
+            "await (async function(){"
+            "try{"
+            "var _db=await new Promise(function(ok,no){"
+            "var r=indexedDB.open('_marimo_launcher',1);"
+            "r.onupgradeneeded=function(){r.result.createObjectStore('config')};"
+            "r.onsuccess=function(){ok(r.result)};"
+            "r.onerror=function(){no(r.error)}"
+            "});"
+            "var _cfg=await new Promise(function(ok){"
+            "var tx=_db.transaction('config','readonly');"
+            "var r=tx.objectStore('config').get('pending');"
+            "r.onsuccess=function(){ok(r.result)};"
+            "r.onerror=function(){ok(null)}"
+            "});"
+            "_db.close();"
+            "if(!_cfg||!_cfg.files||!_cfg.files.length)return;"
+            "var _py="
+            "'import pathlib,json\\n"
+            "from pyodide.http import pyfetch\\n'"
+            "+'_c=json.loads(\\x27'"
+            "+JSON.stringify(_cfg).replace(/\\x27/g,'')"
+            "+'\\x27)\\n'"
+            "+'for _f in _c[\\x22files\\x22]:\\n'"
+            "+' _u=_c[\\x22gitlab\\x22]+\\x22/api/v4/projects/\\x22+str(_c[\\x22project\\x22])+\\x22/repository/files/\\x22+_f.replace(\\x22/\\x22,\\x22%2F\\x22)+\\x22/raw?ref=\\x22+_c[\\x22ref\\x22]\\n'"
+            "+' _r=await pyfetch(_u,headers={\\x22Authorization\\x22:\\x22Bearer \\x22+_c[\\x22token\\x22]})\\n'"
+            "+' _d=await _r.bytes()\\n'"
+            "+' _p=pathlib.Path(_f);_p.parent.mkdir(parents=True,exist_ok=True);_p.write_bytes(_d)\\n'"
+            "+'del _c,_f,_u,_r,_d,_p\\n';"
+            f"await {instance_var}.runPythonAsync(_py);"
+            "indexedDB.deleteDatabase('_marimo_launcher');"
+            "}catch(e){}"
+            "})();"
+        )
+
+        # Inject before the first runPythonAsync call
+        insert_pos = m.start()
+        text = text[:insert_pos] + injection + text[insert_pos:]
+        path.write_text(text)
+        patched += 1
+        print(f"  ✓ Injected repo file loader: {path}")
+        print(f"    instance={instance_var}")
+
+    if patched == 0:
+        print("  ⚠ No worker JS files found to patch for repo file loader")
+    else:
+        print(f"  ✓ Patched {patched} worker files")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build air-gapped marimo WASM notebooks for static hosting"
@@ -2256,6 +2444,9 @@ def main():
     # Step 6a-3: Embed layout positions in share link code
     patch_share_layout_embed(output_dir)
 
+    # Step 11b: Patch index.html to support launched notebooks
+    patch_index_for_launcher(output_dir)
+
     # Check patch errors before proceeding to downloads (fail fast)
     check_patch_errors()
 
@@ -2271,11 +2462,17 @@ def main():
     else:
         patch_micropip_for_offline(output_dir)
 
+    # Step 11c: Inject repo file loader into worker JS
+    inject_repo_file_loader(output_dir)
+
     # Step 8: Create index page
     create_index_page(output_dir, notebooks)
 
     # Step 9: Metadata files
     add_metadata_files(output_dir)
+
+    # Step 12: Build launch page (opt-in, creates new file)
+    build_launch_page(output_dir)
 
     # Step 10: Verify the build
     verify_build(output_dir, slim=args.slim)
