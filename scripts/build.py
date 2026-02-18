@@ -2442,7 +2442,12 @@ def patch_index_for_launcher(output_dir):
         refresh_script = (
             '\n<script>'
             'try{var _bc=new BroadcastChannel("_marimo_launcher");'
-            '_bc.onmessage=function(){_bc.close();'
+            '_bc.onmessage=function(ev){_bc.close();'
+            'if(ev.data==="auth_expired"){'
+            'localStorage.removeItem("_marimo_oauth_token");'
+            'localStorage.removeItem("_marimo_notebook");'
+            'window.location.href="launch.html"+window.location.search;'
+            'return;}'
             'setTimeout(function(){'
             'var b=document.querySelector("[data-testid=\\"file-explorer-refresh-button\\"]");'
             'if(b)b.click();'
@@ -2526,13 +2531,19 @@ def inject_repo_file_loader(output_dir):
             "+'for _f in _c[\\x22files\\x22]:\\n'"
             "+' _u=_c[\\x22gitlab\\x22]+\\x22/api/v4/projects/\\x22+str(_c[\\x22project\\x22])+\\x22/repository/files/\\x22+_f.replace(\\x22/\\x22,\\x22%2F\\x22)+\\x22/raw?ref=\\x22+_c[\\x22ref\\x22]\\n'"
             "+' _r=await pyfetch(_u,headers={\\x22Authorization\\x22:\\x22Bearer \\x22+_c[\\x22token\\x22]})\\n'"
+            "+' if _r.status==401:raise Exception(\\x22TOKEN_EXPIRED\\x22)\\n'"
+            "+' if _r.status!=200:raise Exception(\\x22HTTP_\\x22+str(_r.status))\\n'"
             "+' _d=await _r.bytes()\\n'"
             "+' _p=pathlib.Path(_f);_p.parent.mkdir(parents=True,exist_ok=True);_p.write_bytes(_d)\\n'"
             "+'del _c,_f,_u,_r,_d,_p\\n';"
             f'await {instance_var}["runPythonAsync"](_py);'
             "console.log('[marimo-launcher] data files loaded successfully');"
             "try{new BroadcastChannel('_marimo_launcher').postMessage('done')}catch(e){}"
-            "}catch(e){console.error('[marimo-launcher] data file load failed:',e)}"
+            "}catch(e){"
+            "console.error('[marimo-launcher] data file load failed:',e);"
+            "if(String(e).indexOf('TOKEN_EXPIRED')!==-1){"
+            "try{new BroadcastChannel('_marimo_launcher').postMessage('auth_expired')}catch(e2){}}"
+            "}"
             "})();"
         )
 
