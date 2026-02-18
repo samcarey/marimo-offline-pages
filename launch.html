@@ -344,9 +344,10 @@ async function launch() {
     }
   }
 
-  // Redirect to the notebook
+  // Redirect to the notebook, preserving project context in the URL
   setStatus('Launching notebook&hellip;');
-  window.location.href = 'index.html';
+  var dest = 'index.html?project=' + encodeURIComponent(PROJECT) + '&ref=' + encodeURIComponent(REF);
+  window.location.href = dest;
 }
 
 /* ------------------------------------------------------------------ */

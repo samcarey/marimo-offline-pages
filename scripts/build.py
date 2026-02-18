@@ -2293,7 +2293,11 @@ def patch_index_for_launcher(output_dir):
     """Extend the inline share-handler script to load notebooks from launch.html.
 
     When launch.html stores notebook code in ``localStorage._marimo_notebook``,
-    this patch reads it, injects it into ``<marimo-code>``, and clears storage.
+    this patch reads it, injects it into ``<marimo-code>``.  The notebook code
+    is kept in localStorage so that page refreshes reload the same notebook.
+    If ``?project=`` is in the URL but localStorage is empty (e.g. cache
+    cleared), redirect back to launch.html to re-fetch.
+
     The check runs before the existing ``#code/`` hash check.
     """
     print("\n══════════════════════════════════════════")
@@ -2302,11 +2306,15 @@ def patch_index_for_launcher(output_dir):
 
     launcher_js = (
         "// --- Launcher: load notebook from launch.html ---\n"
-        "      var _lc=localStorage.getItem('_marimo_notebook');\n"
-        "      if(_lc){\n"
-        "        localStorage.removeItem('_marimo_notebook');\n"
-        "        var _el=document.querySelector('marimo-code');\n"
-        "        if(_el){_el.textContent=encodeURIComponent(_lc);}\n"
+        "      var _lp=new URLSearchParams(window.location.search);\n"
+        "      if(_lp.has('project')){\n"
+        "        var _lc=localStorage.getItem('_marimo_notebook');\n"
+        "        if(_lc){\n"
+        "          var _el=document.querySelector('marimo-code');\n"
+        "          if(_el){_el.textContent=encodeURIComponent(_lc);}\n"
+        "          return;\n"
+        "        }\n"
+        "        window.location.href='launch.html'+window.location.search;\n"
         "        return;\n"
         "      }\n"
     )
@@ -2404,7 +2412,6 @@ def inject_repo_file_loader(output_dir):
             "+' _p=pathlib.Path(_f);_p.parent.mkdir(parents=True,exist_ok=True);_p.write_bytes(_d)\\n'"
             "+'del _c,_f,_u,_r,_d,_p\\n';"
             f"await {instance_var}.runPythonAsync(_py);"
-            "indexedDB.deleteDatabase('_marimo_launcher');"
             "}catch(e){console.error('[marimo-launcher] data file load failed:',e)}"
             "})();"
         )
