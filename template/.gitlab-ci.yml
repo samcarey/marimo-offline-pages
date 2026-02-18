@@ -10,10 +10,15 @@ setup-readme:
       if grep -q 'project=PROJECT_ID' README.md; then
         sed -i "s/PROJECT_ID/$CI_PROJECT_ID/g" README.md
         B64=$(base64 -w0 README.md)
+        URL="$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/commits"
+        echo "API URL: $URL"
+        echo "Branch: $CI_COMMIT_BRANCH"
+        echo "Project ID: $CI_PROJECT_ID"
+        PAYLOAD='{"branch":"'"$CI_COMMIT_BRANCH"'","commit_message":"Set project ID in launch badge","actions":[{"action":"update","file_path":"README.md","encoding":"base64","content":"'"$B64"'"}]}'
         wget --header="JOB-TOKEN: $CI_JOB_TOKEN" \
              --header="Content-Type: application/json" \
-             --post-data='{"branch":"'"$CI_COMMIT_BRANCH"'","commit_message":"Set project ID in launch badge","actions":[{"action":"update","file_path":"README.md","encoding":"base64","content":"'"$B64"'"}]}' \
-             -O- "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/commits"
+             --post-data="$PAYLOAD" \
+             -O- -S "$URL" 2>&1 || echo "wget failed with exit code $?"
       else
         echo "PROJECT_ID already replaced, skipping."
       fi
