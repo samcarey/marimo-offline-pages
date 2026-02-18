@@ -1948,6 +1948,80 @@ def create_index_page(output_dir, notebooks):
 
 
 # ---------------------------------------------------------------------------
+# Cache busting: rehash patched assets
+# ---------------------------------------------------------------------------
+
+def rehash_patched_assets(output_dir):
+    """Rename patched JS files with a content hash so browsers fetch fresh copies.
+
+    Vite's original hashes reflect pre-patch content; after our patches the files
+    change but keep the same name, causing stale-cache problems.  This step
+    computes a short hash of the final content, renames each `assets/*.js` file,
+    and updates all references in HTML/JS/CSS files.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 14: Rehashing patched assets")
+    print("══════════════════════════════════════════")
+
+    assets_dir = Path(output_dir) / "assets"
+    if not assets_dir.is_dir():
+        print("  ⚠ No assets/ directory found — skipping rehash")
+        return
+
+    # Collect JS files to rehash
+    renames = {}  # old_name -> new_name
+    for js_file in sorted(assets_dir.glob("*.js")):
+        old_name = js_file.name
+        content = js_file.read_bytes()
+        short_hash = hashlib.md5(content).hexdigest()[:8]
+
+        # Replace the Vite hash portion: name-OLDHASH.js -> name-NEWHASH.js
+        m = re.match(r'^(.+)-([A-Za-z0-9_-]+)(\.js)$', old_name)
+        if m:
+            new_name = f"{m.group(1)}-{short_hash}{m.group(3)}"
+        else:
+            # No hash in filename — skip
+            continue
+
+        if new_name == old_name:
+            continue
+
+        renames[old_name] = new_name
+
+    if not renames:
+        print("  ✓ All asset hashes are up to date")
+        return
+
+    # Update references in all text files, then rename
+    text_globs = ["**/*.html", "**/*.js", "**/*.css"]
+    text_files = []
+    for pattern in text_globs:
+        text_files.extend(Path(output_dir).rglob(pattern))
+
+    for text_file in text_files:
+        try:
+            content = text_file.read_text(errors="ignore")
+        except Exception:
+            continue
+        original = content
+        for old_name, new_name in renames.items():
+            content = content.replace(old_name, new_name)
+        if content != original:
+            text_file.write_text(content)
+
+    # Rename the files
+    for old_name, new_name in renames.items():
+        old_path = assets_dir / old_name
+        new_path = assets_dir / new_name
+        if old_path.exists():
+            old_path.rename(new_path)
+
+    print(f"  ✓ Rehashed {len(renames)} asset files")
+    for old_name, new_name in sorted(renames.items()):
+        print(f"    {old_name} → {new_name}")
+
+
+# ---------------------------------------------------------------------------
 # Step 9: Add .nojekyll and headers
 # ---------------------------------------------------------------------------
 
@@ -2549,6 +2623,9 @@ def main():
 
     # Step 13: Build create page (opt-in, creates new file)
     build_create_page(output_dir)
+
+    # Step 14: Rehash patched assets (cache busting)
+    rehash_patched_assets(output_dir)
 
     # Step 10: Verify the build
     verify_build(output_dir, slim=args.slim)
