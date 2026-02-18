@@ -362,7 +362,7 @@ async function init() {
   }
 
   clearStatus();
-  formEl.style.display = '';
+  formEl.style.display = 'block';
 }
 
 /* ------------------------------------------------------------------ */
@@ -390,7 +390,7 @@ document.getElementById('create-form').addEventListener('submit', function(e) {
     );
   }).catch(function(err) {
     showError(typeof err.message === 'string' ? err.message : String(err));
-    formEl.style.display = '';
+    formEl.style.display = 'block';
     btn.disabled = false;
   });
 });
