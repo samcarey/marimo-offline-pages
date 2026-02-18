@@ -314,7 +314,7 @@ async function createProject(name, namespaceId, removeFork) {
       '/api/v4/projects/' + projectId + '/repository/files/README.md?ref=main');
     var content = atob(fileResp.content);
     var updated = content.replace(/PAGES_URL/g, PAGES_URL)
-                         .replace(/GROUP%2FPROJECT/g, String(projectId));
+                         .replace(/PROJECT_ID/g, String(projectId));
     await gitlabJSON('PUT',
       '/api/v4/projects/' + projectId + '/repository/files/README.md', {
         branch: 'main',

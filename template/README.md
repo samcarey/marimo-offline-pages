@@ -1,17 +1,15 @@
 # My Analysis
 
-[![Launch Notebook](PAGES_URL/assets/launch-badge.svg)](PAGES_URL/launch.html?project=GROUP%2FPROJECT)
+[![Launch Notebook](PAGES_URL/assets/launch-badge.svg)](PAGES_URL/launch.html?project=PROJECT_ID)
 
 ## Setup
 
 If you created this project via **create.html**, the badge URL is already
 configured — no manual steps needed.
 
-Otherwise, replace the badge URL above:
+Otherwise, replace the placeholders in the badge URL above:
 - `PAGES_URL` → your marimo Pages site URL
-- `GROUP%2FPROJECT` → your project's full path, URL-encoded
-  (e.g. `my-group%2Fmy-analysis` for `my-group/my-analysis`,
-   or just use the numeric project ID from Settings → General)
+- `PROJECT_ID` → your project's numeric ID (Settings → General)
 
 Or skip the README badge and use a **group-level badge** instead:
 Group → Settings → General → Badges, with link
