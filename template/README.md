@@ -1,7 +1,19 @@
 # My Analysis
 
-The **Launch Notebook** badge at the top of this project opens the notebook
-in the browser. (Badge is added automatically via group settings.)
+[![Launch Notebook](https://img.shields.io/badge/Launch-Notebook-blue)](PAGES_URL/launch.html?project=GROUP%2FPROJECT)
+
+## Setup
+
+Replace the badge URL above:
+- `PAGES_URL` → your marimo Pages site URL
+- `GROUP%2FPROJECT` → your project's full path, URL-encoded
+  (e.g. `my-group%2Fmy-analysis` for `my-group/my-analysis`,
+   or just use the numeric project ID from Settings → General)
+
+Or skip the README badge and use a **group-level badge** instead:
+Group → Settings → General → Badges, with link
+`PAGES_URL/launch.html?project=%{project_id}` — applies to all projects
+in the group automatically.
 
 ## Usage
 
