@@ -1,10 +1,13 @@
 # My Analysis
 
-[![Launch Notebook](https://img.shields.io/badge/Launch-Notebook-blue)](PAGES_URL/launch.html?project=GROUP%2FPROJECT)
+[![Launch Notebook](PAGES_URL/assets/launch-badge.svg)](PAGES_URL/launch.html?project=GROUP%2FPROJECT)
 
 ## Setup
 
-Replace the badge URL above:
+If you created this project via **create.html**, the badge URL is already
+configured — no manual steps needed.
+
+Otherwise, replace the badge URL above:
 - `PAGES_URL` → your marimo Pages site URL
 - `GROUP%2FPROJECT` → your project's full path, URL-encoded
   (e.g. `my-group%2Fmy-analysis` for `my-group/my-analysis`,

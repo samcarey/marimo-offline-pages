@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Create marimo project</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 520px; margin: 4em auto; padding: 0 1em; color: #24292e; }
+  h1 { font-size: 1.4em; margin-bottom: 0.3em; text-align: center; }
+  .status { color: #586069; margin: 1.5em 0; min-height: 1.6em; text-align: center; }
+  .spinner { display: inline-block; width: 1.2em; height: 1.2em; border: 2px solid #d1d5da;
+             border-top-color: #2f80ed; border-radius: 50%; animation: spin 0.7s linear infinite;
+             vertical-align: middle; margin-right: 0.4em; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .error { color: #cb2431; text-align: left; background: #ffeef0; padding: 1em; border-radius: 6px; margin: 1em 0; }
+  .error code { font-size: 0.9em; }
+  .success { text-align: left; background: #dcffe4; padding: 1em; border-radius: 6px; margin: 1em 0; color: #22863a; }
+  .success a { color: #22863a; font-weight: 600; }
+  a { color: #2f80ed; }
+  form { text-align: left; }
+  label { display: block; margin: 1em 0 0.3em; font-weight: 600; font-size: 0.95em; }
+  input[type="text"], select { width: 100%; padding: 0.5em; border: 1px solid #d1d5da; border-radius: 4px; font-size: 0.95em; box-sizing: border-box; }
+  .checkbox-row { display: flex; align-items: center; gap: 0.5em; margin: 1em 0; }
+  .checkbox-row input { margin: 0; }
+  .checkbox-row label { margin: 0; font-weight: normal; }
+  button[type="submit"] { margin-top: 1.2em; padding: 0.6em 1.4em; background: #2f80ed; color: #fff;
+                          border: none; border-radius: 4px; font-size: 1em; cursor: pointer; }
+  button[type="submit"]:hover { background: #2868c7; }
+  button[type="submit"]:disabled { background: #94baf7; cursor: not-allowed; }
+  #form-section { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Create marimo Project</h1>
+<div class="status" id="status"><span class="spinner"></span>Initializing&hellip;</div>
+<div id="error-box"></div>
+
+<div id="form-section">
+  <form id="create-form">
+    <label for="project-name">Project name</label>
+    <input type="text" id="project-name" placeholder="my-analysis" required pattern="[a-zA-Z0-9_\-.]+" title="Letters, numbers, hyphens, underscores, dots">
+
+    <label for="namespace">Namespace</label>
+    <select id="namespace"><option value="">Loading&hellip;</option></select>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="remove-fork" checked>
+      <label for="remove-fork">Remove fork relationship (makes project independent)</label>
+    </div>
+
+    <button type="submit" id="submit-btn">Create project</button>
+  </form>
+</div>
+
+<div id="result-box"></div>
+
+<script>
+/* ------------------------------------------------------------------ */
+/*  Configuration (replaced at build time by build.py)                 */
+/* ------------------------------------------------------------------ */
+var OAUTH_CLIENT_ID    = '__OAUTH_CLIENT_ID__';
+var GITLAB_URL         = '__GITLAB_URL__';
+var TEMPLATE_PROJECT_ID = '__TEMPLATE_PROJECT_ID__';
+var PAGES_URL          = '__PAGES_URL__';
+
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
+var statusEl  = document.getElementById('status');
+var errorEl   = document.getElementById('error-box');
+var resultEl  = document.getElementById('result-box');
+var formEl    = document.getElementById('form-section');
+
+function setStatus(msg) {
+  statusEl.innerHTML = '<span class="spinner"></span>' + msg;
+  statusEl.style.display = '';
+}
+
+function clearStatus() {
+  statusEl.style.display = 'none';
+}
+
+function showError(msg) {
+  clearStatus();
+  errorEl.innerHTML = '<div class="error">' + msg + '</div>';
+}
+
+function showSuccess(html) {
+  clearStatus();
+  resultEl.innerHTML = '<div class="success">' + html + '</div>';
+}
+
+function randomHex(len) {
+  var a = new Uint8Array(len);
+  crypto.getRandomValues(a);
+  return Array.from(a, function(b) { return b.toString(16).padStart(2, '0'); }).join('');
+}
+
+/* ------------------------------------------------------------------ */
+/*  Token management — separate key for api-scoped token               */
+/* ------------------------------------------------------------------ */
+var TOKEN_KEY = '_marimo_oauth_token_api';
+
+function getToken() { return localStorage.getItem(TOKEN_KEY); }
+function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }
+
+async function validateToken(token) {
+  try {
+    var resp = await fetch(GITLAB_URL + '/api/v4/user', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    return resp.ok;
+  } catch (e) { return false; }
+}
+
+/* ------------------------------------------------------------------ */
+/*  OAuth — Authorization Code + PKCE (plain), scope: api              */
+/* ------------------------------------------------------------------ */
+function startOAuth() {
+  var state = randomHex(20);
+  var codeVerifier = randomHex(32);
+
+  sessionStorage.setItem('_create_oauth_state', state);
+  sessionStorage.setItem('_create_oauth_verifier', codeVerifier);
+
+  var redirectUri = window.location.href.split('?')[0].split('#')[0];
+  sessionStorage.setItem('_create_redirect_uri', redirectUri);
+
+  var authParams = new URLSearchParams({
+    client_id:             OAUTH_CLIENT_ID,
+    redirect_uri:          redirectUri,
+    response_type:         'code',
+    scope:                 'api',
+    state:                 state,
+    code_challenge:        codeVerifier,
+    code_challenge_method: 'plain',
+  });
+
+  window.location.href = GITLAB_URL + '/oauth/authorize?' + authParams;
+}
+
+async function handleOAuthCallback() {
+  var cbParams = new URLSearchParams(window.location.search);
+  var code = cbParams.get('code');
+  var state = cbParams.get('state');
+  if (!code) return false;
+
+  // Clean URL
+  history.replaceState(null, '', window.location.pathname);
+
+  // Verify state
+  var savedState = sessionStorage.getItem('_create_oauth_state');
+  if (state !== savedState) {
+    showError('OAuth state mismatch. Please try again.');
+    return true;
+  }
+
+  setStatus('Exchanging authorization code&hellip;');
+
+  var codeVerifier = sessionStorage.getItem('_create_oauth_verifier');
+  var redirectUri = sessionStorage.getItem('_create_redirect_uri');
+
+  var body = new URLSearchParams({
+    client_id:     OAUTH_CLIENT_ID,
+    code:          code,
+    grant_type:    'authorization_code',
+    redirect_uri:  redirectUri,
+    code_verifier: codeVerifier,
+  });
+
+  try {
+    var resp = await fetch(GITLAB_URL + '/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body,
+    });
+    if (!resp.ok) {
+      var errText = await resp.text();
+      showError('Token exchange failed (HTTP ' + resp.status + '). ' +
+        '<code>' + errText.substring(0, 200) + '</code>');
+      return true;
+    }
+    var data = await resp.json();
+    setToken(data.access_token);
+  } catch (err) {
+    showError('Token exchange error: ' + err.message);
+    return true;
+  }
+
+  // Clean up session storage
+  sessionStorage.removeItem('_create_oauth_state');
+  sessionStorage.removeItem('_create_oauth_verifier');
+  sessionStorage.removeItem('_create_redirect_uri');
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
+/*  GitLab API helpers                                                 */
+/* ------------------------------------------------------------------ */
+async function gitlabAPI(method, path, body) {
+  var token = getToken();
+  var opts = {
+    method: method,
+    headers: { 'Authorization': 'Bearer ' + token },
+  };
+  if (body) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  var resp = await fetch(GITLAB_URL + path, opts);
+  if (resp.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    startOAuth();
+    throw new Error('Token expired, re-authenticating...');
+  }
+  return resp;
+}
+
+async function gitlabJSON(method, path, body) {
+  var resp = await gitlabAPI(method, path, body);
+  var data = await resp.json();
+  if (!resp.ok) {
+    var msg = data.message || data.error || JSON.stringify(data);
+    throw { status: resp.status, message: msg };
+  }
+  return data;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Namespace loading                                                  */
+/* ------------------------------------------------------------------ */
+async function loadNamespaces() {
+  var namespaces = await gitlabJSON('GET', '/api/v4/namespaces?owned_only=true&per_page=100');
+  var sel = document.getElementById('namespace');
+  sel.innerHTML = '';
+  namespaces.forEach(function(ns) {
+    var opt = document.createElement('option');
+    opt.value = ns.id;
+    opt.textContent = ns.full_path + ' (' + ns.kind + ')';
+    sel.appendChild(opt);
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Fork + configure project                                           */
+/* ------------------------------------------------------------------ */
+async function pollImportStatus(projectId) {
+  var deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    await new Promise(function(r) { setTimeout(r, 2000); });
+    var proj = await gitlabJSON('GET', '/api/v4/projects/' + projectId);
+    var s = proj.import_status;
+    if (s === 'finished' || s === 'none' || !s) return;
+    if (s === 'failed') throw { status: 500, message: 'Import failed' };
+  }
+  throw { status: 500, message: 'Import timed out (60s)' };
+}
+
+async function createProject(name, namespaceId, removeFork) {
+  // 1. Fork template
+  setStatus('Forking template project&hellip;');
+  var fork;
+  try {
+    fork = await gitlabJSON('POST', '/api/v4/projects/' + TEMPLATE_PROJECT_ID + '/fork', {
+      name: name,
+      path: name,
+      namespace_id: Number(namespaceId),
+    });
+  } catch (e) {
+    if (e.status === 409) {
+      throw { status: 409, message: 'A project named <b>' + name + '</b> already exists in this namespace. Choose a different name.' };
+    }
+    if (e.status === 403) {
+      throw { status: 403, message: 'You do not have permission to fork into this namespace.' };
+    }
+    throw e;
+  }
+
+  var projectId = fork.id;
+  var projectUrl = fork.web_url;
+
+  // 2. Wait for fork to complete
+  setStatus('Waiting for project import&hellip;');
+  await pollImportStatus(projectId);
+
+  // 3. Remove fork relationship (optional)
+  if (removeFork) {
+    setStatus('Removing fork relationship&hellip;');
+    try {
+      await gitlabAPI('DELETE', '/api/v4/projects/' + projectId + '/fork');
+    } catch (e) {
+      // Non-fatal — project still works
+    }
+  }
+
+  // 4. Add launch badge
+  setStatus('Adding launch badge&hellip;');
+  var badgeLinkUrl = PAGES_URL + '/launch.html?project=' + projectId;
+  var badgeImageUrl = PAGES_URL + '/assets/launch-badge.svg';
+  try {
+    await gitlabJSON('POST', '/api/v4/projects/' + projectId + '/badges', {
+      link_url: badgeLinkUrl,
+      image_url: badgeImageUrl,
+    });
+  } catch (e) {
+    // Non-fatal
+  }
+
+  // 5. Update README placeholder
+  setStatus('Updating README&hellip;');
+  try {
+    var fileResp = await gitlabJSON('GET',
+      '/api/v4/projects/' + projectId + '/repository/files/README.md?ref=main');
+    var content = atob(fileResp.content);
+    var updated = content.replace(/PAGES_URL/g, PAGES_URL)
+                         .replace(/GROUP%2FPROJECT/g, String(projectId));
+    await gitlabJSON('PUT',
+      '/api/v4/projects/' + projectId + '/repository/files/README.md', {
+        branch: 'main',
+        content: updated,
+        commit_message: 'Configure launch badge URL',
+      });
+  } catch (e) {
+    // Non-fatal — user can update README manually
+  }
+
+  return { id: projectId, url: projectUrl, badgeLink: badgeLinkUrl };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main flow                                                          */
+/* ------------------------------------------------------------------ */
+async function init() {
+  // Handle OAuth callback first
+  var wasCallback = await handleOAuthCallback();
+
+  // Check for valid token
+  var token = getToken();
+  if (token) {
+    setStatus('Verifying authentication&hellip;');
+    var valid = await validateToken(token);
+    if (!valid) {
+      localStorage.removeItem(TOKEN_KEY);
+      token = null;
+    }
+  }
+
+  if (!token) {
+    setStatus('Redirecting to GitLab login&hellip;');
+    startOAuth();
+    return;
+  }
+
+  // Load namespaces and show form
+  setStatus('Loading namespaces&hellip;');
+  try {
+    await loadNamespaces();
+  } catch (e) {
+    showError('Could not load namespaces: ' + e.message);
+    return;
+  }
+
+  clearStatus();
+  formEl.style.display = '';
+}
+
+/* ------------------------------------------------------------------ */
+/*  Form submit handler                                                */
+/* ------------------------------------------------------------------ */
+document.getElementById('create-form').addEventListener('submit', function(e) {
+  e.preventDefault();
+  var name = document.getElementById('project-name').value.trim();
+  var nsId = document.getElementById('namespace').value;
+  var removeFork = document.getElementById('remove-fork').checked;
+  var btn = document.getElementById('submit-btn');
+
+  if (!name) return;
+
+  btn.disabled = true;
+  formEl.style.display = 'none';
+  errorEl.innerHTML = '';
+  resultEl.innerHTML = '';
+
+  createProject(name, nsId, removeFork).then(function(result) {
+    showSuccess(
+      '<b>Project created!</b><br><br>' +
+      'Repository: <a href="' + result.url + '" target="_blank">' + result.url + '</a><br>' +
+      'Launch: <a href="' + result.badgeLink + '">' + result.badgeLink + '</a>'
+    );
+  }).catch(function(err) {
+    showError(typeof err.message === 'string' ? err.message : String(err));
+    formEl.style.display = '';
+    btn.disabled = false;
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Start                                                              */
+/* ------------------------------------------------------------------ */
+init().catch(function(err) {
+  showError('Unexpected error: ' + err.message);
+});
+</script>
+</body>
+</html>

@@ -2228,6 +2228,67 @@ def build_launch_page(output_dir):
     print(f"    gitlab_url={gitlab_url}")
 
 
+def build_create_page(output_dir):
+    """Generate create.html with OAuth + template config baked in (opt-in).
+
+    Reads ``[oauth] client-id``, ``gitlab-url``, ``template-project-id``,
+    and ``pages-url`` from pip.conf and replaces placeholders in the
+    create.html template.  If any are missing the step is silently skipped.
+    Also copies ``assets/launch-badge.svg`` into the output directory.
+    """
+    print("\n══════════════════════════════════════════")
+    print("Step 13: Building create page (opt-in)")
+    print("══════════════════════════════════════════")
+
+    client_id, gitlab_url = _get_oauth_config()
+    if not client_id or not gitlab_url:
+        print("  ℹ [oauth] client-id / gitlab-url not set in pip.conf — skipping")
+        return
+
+    pip_conf = Path("pip.conf")
+    cfg = configparser.ConfigParser()
+    cfg.read(pip_conf)
+    template_project_id = cfg.get("oauth", "template-project-id", fallback=None)
+    pages_url = cfg.get("oauth", "pages-url", fallback=None)
+
+    if template_project_id:
+        template_project_id = template_project_id.strip()
+    if pages_url:
+        pages_url = pages_url.strip().rstrip("/")
+
+    if not template_project_id or not pages_url:
+        print("  ℹ [oauth] template-project-id / pages-url not set — skipping create.html")
+        return
+
+    template = Path("create.html")
+    if not template.exists():
+        print("  ⚠ create.html template not found at repo root — skipping")
+        return
+
+    html = template.read_text()
+    html = html.replace("__OAUTH_CLIENT_ID__", client_id)
+    html = html.replace("__GITLAB_URL__", gitlab_url)
+    html = html.replace("__TEMPLATE_PROJECT_ID__", template_project_id)
+    html = html.replace("__PAGES_URL__", pages_url)
+
+    dest = Path(output_dir) / "create.html"
+    dest.write_text(html)
+    print(f"  ✓ create.html generated with client_id={client_id[:8]}…")
+    print(f"    gitlab_url={gitlab_url}")
+    print(f"    template_project_id={template_project_id}")
+    print(f"    pages_url={pages_url}")
+
+    # Copy launch-badge.svg
+    badge_src = Path("assets/launch-badge.svg")
+    if badge_src.exists():
+        badge_dir = Path(output_dir) / "assets"
+        badge_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(badge_src, badge_dir / "launch-badge.svg")
+        print("  ✓ Copied assets/launch-badge.svg")
+    else:
+        print("  ⚠ assets/launch-badge.svg not found — badge will not be available")
+
+
 def patch_index_for_launcher(output_dir):
     """Extend the inline share-handler script to load notebooks from launch.html.
 
@@ -2473,6 +2534,9 @@ def main():
 
     # Step 12: Build launch page (opt-in, creates new file)
     build_launch_page(output_dir)
+
+    # Step 13: Build create page (opt-in, creates new file)
+    build_create_page(output_dir)
 
     # Step 10: Verify the build
     verify_build(output_dir, slim=args.slim)
