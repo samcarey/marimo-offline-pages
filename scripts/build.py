@@ -2603,14 +2603,16 @@ def main():
     # Step 6c: Download extra packages from requirements-wasm-extras.in
     download_wasm_extras(output_dir)
 
+    # Step 11c: Inject repo file loader into worker JS
+    # (must run BEFORE inject_micropip_index — both inject before the first
+    # runPythonAsync, so the last one to run ends up first in execution order)
+    inject_repo_file_loader(output_dir)
+
     # Step 7: Configure package loading
     if args.slim:
         inject_micropip_index(output_dir)
     else:
         patch_micropip_for_offline(output_dir)
-
-    # Step 11c: Inject repo file loader into worker JS
-    inject_repo_file_loader(output_dir)
 
     # Step 8: Create index page
     create_index_page(output_dir, notebooks)
