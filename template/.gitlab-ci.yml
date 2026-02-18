@@ -1,3 +1,7 @@
+workflow:
+  rules:
+    - when: always
+
 setup-readme:
   stage: .pre
   image: alpine:latest
@@ -12,5 +16,3 @@ setup-readme:
         git commit -m "Set project ID in launch badge"
         git push "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:${CI_COMMIT_BRANCH}
       fi
-  rules:
-    - when: always
