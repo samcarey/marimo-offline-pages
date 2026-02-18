@@ -1839,6 +1839,33 @@ def patch_micropip_for_offline(output_dir):
     print("    See: https://pyodide.org/en/stable/usage/loading-packages.html")
 
 
+def _find_runpython_insertion(text):
+    """Find the Pyodide instance variable and correct insertion point.
+
+    Returns ``(instance_var, insert_pos)`` where *insert_pos* is right before
+    the ``await`` keyword (if present) of the first **dot-notation**
+    ``instance.runPythonAsync(`` call.  Bracket-notation calls inserted by
+    prior injection steps are ignored.
+
+    Returns ``(None, None)`` if no match is found.
+    """
+    m = re.search(r'(\w+)\.runPythonAsync\(', text)
+    if not m:
+        return None, None
+
+    instance_var = m.group(1)
+
+    # Look backward for `await` immediately before the match
+    pre = text[:m.start()]
+    await_match = re.search(r'await\s+$', pre)
+    if await_match:
+        insert_pos = await_match.start()
+    else:
+        insert_pos = m.start()
+
+    return instance_var, insert_pos
+
+
 def inject_micropip_index(output_dir):
     """Configure micropip to use a custom PyPI index with fallback (--slim mode).
 
@@ -1872,22 +1899,18 @@ def inject_micropip_index(output_dir):
             continue  # Skip Pyodide's own files
         text = path.read_text(errors="ignore")
 
-        # Find the first .runPythonAsync( call to identify the Pyodide
-        # instance variable name (e.g., n.runPythonAsync(...))
-        m = re.search(r'(\w+)\.runPythonAsync\(', text)
-        if not m:
+        instance_var, insert_pos = _find_runpython_insertion(text)
+        if not instance_var:
             continue
 
-        instance_var = m.group(1)
+        # Use bracket notation so other injections' regex won't match this
         inject_code = (
-            f'await {instance_var}.runPythonAsync('
+            f'await {instance_var}["runPythonAsync"]('
             f"'import micropip;micropip.set_index_urls("
             f'[\\"{simple_url}\\",\\"https://pypi.org/simple/\\"])'
             f"');"
         )
 
-        # Inject before the first runPythonAsync call
-        insert_pos = m.start()
         text = text[:insert_pos] + inject_code + text[insert_pos:]
         path.write_text(text)
         patched += 1
@@ -2445,17 +2468,16 @@ def inject_repo_file_loader(output_dir):
             print(f"  ✓ Repo file loader already present: {path}")
             continue
 
-        # Find the Pyodide instance variable from .runPythonAsync(
-        m = re.search(r'(\w+)\.runPythonAsync\(', text)
-        if not m:
+        instance_var, insert_pos = _find_runpython_insertion(text)
+        if not instance_var:
             continue
-
-        instance_var = m.group(1)
 
         # Build the injection: read IndexedDB, fetch files via pyfetch, clean up.
         # The injected JS reads config from IndexedDB at runtime, builds a
         # Python script string dynamically, and runs it via runPythonAsync.
         # We use \x27 for single quotes inside JS strings to avoid escaping hell.
+        # IMPORTANT: use bracket notation ["runPythonAsync"] so the regex in
+        # other injection steps (inject_micropip_index) won't match this call.
         injection = (
             "await (async function(){"
             "console.log('[marimo-launcher] worker injection running');"
@@ -2489,14 +2511,12 @@ def inject_repo_file_loader(output_dir):
             "+' _d=await _r.bytes()\\n'"
             "+' _p=pathlib.Path(_f);_p.parent.mkdir(parents=True,exist_ok=True);_p.write_bytes(_d)\\n'"
             "+'del _c,_f,_u,_r,_d,_p\\n';"
-            f"await {instance_var}.runPythonAsync(_py);"
+            f'await {instance_var}["runPythonAsync"](_py);'
             "console.log('[marimo-launcher] data files loaded successfully');"
             "}catch(e){console.error('[marimo-launcher] data file load failed:',e)}"
             "})();"
         )
 
-        # Inject before the first runPythonAsync call
-        insert_pos = m.start()
         text = text[:insert_pos] + injection + text[insert_pos:]
         path.write_text(text)
         patched += 1
@@ -2603,16 +2623,14 @@ def main():
     # Step 6c: Download extra packages from requirements-wasm-extras.in
     download_wasm_extras(output_dir)
 
-    # Step 11c: Inject repo file loader into worker JS
-    # (must run BEFORE inject_micropip_index — both inject before the first
-    # runPythonAsync, so the last one to run ends up first in execution order)
-    inject_repo_file_loader(output_dir)
-
     # Step 7: Configure package loading
     if args.slim:
         inject_micropip_index(output_dir)
     else:
         patch_micropip_for_offline(output_dir)
+
+    # Step 11c: Inject repo file loader into worker JS
+    inject_repo_file_loader(output_dir)
 
     # Step 8: Create index page
     create_index_page(output_dir, notebooks)
