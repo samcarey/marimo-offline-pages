@@ -2384,6 +2384,7 @@ def inject_repo_file_loader(output_dir):
         # We use \x27 for single quotes inside JS strings to avoid escaping hell.
         injection = (
             "await (async function(){"
+            "console.log('[marimo-launcher] worker injection running');"
             "try{"
             "var _db=await new Promise(function(ok,no){"
             "var r=indexedDB.open('_marimo_launcher',1);"
@@ -2398,7 +2399,10 @@ def inject_repo_file_loader(output_dir):
             "r.onerror=function(){ok(null)}"
             "});"
             "_db.close();"
-            "if(!_cfg||!_cfg.files||!_cfg.files.length)return;"
+            "console.log('[marimo-launcher] IndexedDB config:',_cfg);"
+            "if(!_cfg||!_cfg.files||!_cfg.files.length){"
+            "console.log('[marimo-launcher] no data files in config');return;}"
+            "console.log('[marimo-launcher] fetching',_cfg.files.length,'data files:',_cfg.files);"
             "var _py="
             "'import pathlib,json\\n"
             "from pyodide.http import pyfetch\\n'"
@@ -2412,6 +2416,7 @@ def inject_repo_file_loader(output_dir):
             "+' _p=pathlib.Path(_f);_p.parent.mkdir(parents=True,exist_ok=True);_p.write_bytes(_d)\\n'"
             "+'del _c,_f,_u,_r,_d,_p\\n';"
             f"await {instance_var}.runPythonAsync(_py);"
+            "console.log('[marimo-launcher] data files loaded successfully');"
             "}catch(e){console.error('[marimo-launcher] data file load failed:',e)}"
             "})();"
         )
