@@ -100,8 +100,13 @@ def run(cmd, **kwargs):
     return result
 
 
+def _has_curl():
+    """Check if curl is available."""
+    return shutil.which("curl") is not None
+
+
 def download(url, dest, user_agent=None, retries=3):
-    """Download a URL to a local path, with retry on transient failures."""
+    """Download a URL to a local path, using curl when available."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
@@ -110,6 +115,24 @@ def download(url, dest, user_agent=None, retries=3):
 
     print(f"  ↓ Downloading: {url}")
     print(f"    → {dest}")
+
+    if _has_curl():
+        cmd = [
+            "curl", "-fSL",
+            "--retry", str(retries),
+            "--retry-delay", "5",
+            "--retry-all-errors",
+            "--connect-timeout", "30",
+            "--max-time", "600",
+            "-o", str(dest),
+        ]
+        if user_agent:
+            cmd += ["-A", user_agent]
+        cmd.append(url)
+        subprocess.run(cmd, check=True)
+        return
+
+    # Fallback: urllib with manual retry
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     for attempt in range(1, retries + 1):
         req = urllib.request.Request(url)
