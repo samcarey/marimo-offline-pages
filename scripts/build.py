@@ -304,7 +304,7 @@ def download_pyodide(version, output_dir):
     )
 
     tarball_path = Path(output_dir) / f"pyodide-{version}.tar.bz2"
-    download(tarball_url, tarball_path)
+    download(tarball_url, tarball_path, retries=10)
 
     # Extract
     print(f"  ⊞ Extracting to {pyodide_dir}...")

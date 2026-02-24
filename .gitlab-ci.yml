@@ -15,11 +15,14 @@ variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
   PIP_CONFIG_FILE: "$CI_PROJECT_DIR/pip.conf"
 
-# Cache pip downloads between runs to speed up builds
+# Cache pip downloads and Pyodide tarball between runs.
+# The Pyodide tarball is ~370MB and the proxy frequently drops the connection,
+# so caching it avoids re-downloading on every pipeline run.
 cache:
-  key: pip-cache
+  key: pip-and-pyodide
   paths:
     - .pip-cache/
+    - _site/pyodide-*.tar.bz2
 
 # Upload Pyodide packages to the GitLab Generic Package Registry.
 # Run this once per Pyodide version to populate the registry, then
