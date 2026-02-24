@@ -2395,7 +2395,11 @@ def patch_index_for_launcher(output_dir):
     If ``?project=`` is in the URL but localStorage is empty (e.g. cache
     cleared), redirect back to launch.html to re-fetch.
 
-    The check runs before the existing ``#code/`` hash check.
+    The check runs before the existing ``#code/`` hash check, but
+    deliberately does NOT ``return`` — so the hash handler still executes.
+    When a ``#code/`` hash is present, the launcher skips the
+    ``<marimo-code>`` overwrite, letting the hash handler remove the element
+    and marimo's ``urlFileStore`` load from the hash instead.
     """
     print("\n══════════════════════════════════════════")
     print("Step 11b: Patching index.html for launcher")
@@ -2407,23 +2411,27 @@ def patch_index_for_launcher(output_dir):
         "      if(_lp.has('project')){\n"
         "        var _lc=localStorage.getItem('_marimo_notebook');\n"
         "        var _lt=localStorage.getItem('_marimo_oauth_token');\n"
-        "        if(_lc && _lt){\n"
-        "          // Update IndexedDB token so worker always has the freshest\n"
-        "          try{var _idb=indexedDB.open('_marimo_launcher',1);\n"
-        "          _idb.onupgradeneeded=function(){_idb.result.createObjectStore('config')};\n"
-        "          _idb.onsuccess=function(){var _d=_idb.result;\n"
-        "            var _tx=_d.transaction('config','readwrite');\n"
-        "            var _st=_tx.objectStore('config');\n"
-        "            var _g=_st.get('pending');\n"
-        "            _g.onsuccess=function(){if(_g.result){_g.result.token=_lt;_st.put(_g.result,'pending')}_d.close()};\n"
-        "            _g.onerror=function(){_d.close()};\n"
-        "          };}catch(e){}\n"
-        "          var _el=document.querySelector('marimo-code');\n"
-        "          if(_el){_el.textContent=encodeURIComponent(_lc);}\n"
+        "        if(!_lc || !_lt){\n"
+        "          window.location.href='launch.html'+window.location.search;\n"
         "          return;\n"
         "        }\n"
-        "        window.location.href='launch.html'+window.location.search;\n"
-        "        return;\n"
+        "        // Update IndexedDB token so worker always has the freshest\n"
+        "        try{var _idb=indexedDB.open('_marimo_launcher',1);\n"
+        "        _idb.onupgradeneeded=function(){_idb.result.createObjectStore('config')};\n"
+        "        _idb.onsuccess=function(){var _d=_idb.result;\n"
+        "          var _tx=_d.transaction('config','readwrite');\n"
+        "          var _st=_tx.objectStore('config');\n"
+        "          var _g=_st.get('pending');\n"
+        "          _g.onsuccess=function(){if(_g.result){_g.result.token=_lt;_st.put(_g.result,'pending')}_d.close()};\n"
+        "          _g.onerror=function(){_d.close()};\n"
+        "        };}catch(e){}\n"
+        "        // Only overwrite <marimo-code> if no #code/ hash — otherwise\n"
+        "        // fall through to let the hash handler below remove it.\n"
+        "        var _hh=window.location.hash;\n"
+        "        if(!_hh||_hh.indexOf('#code/')!==0){\n"
+        "          var _el=document.querySelector('marimo-code');\n"
+        "          if(_el){_el.textContent=encodeURIComponent(_lc);}\n"
+        "        }\n"
         "      }\n"
     )
 
