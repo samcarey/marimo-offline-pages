@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """
-Upload Pyodide packages to a GitLab Generic Package Registry.
+Upload Pyodide distribution to a GitLab Generic Package Registry.
 
-This allows --slim mode to fetch compiled WASM packages (numpy, pandas, etc.)
-from your own GitLab instance instead of cdn.jsdelivr.net, making the
-deployment fully air-gapped.
+Downloads the full Pyodide tarball, adds marimo-base and extra wheels,
+rewrites pyodide-lock.json with absolute registry URLs, then uploads
+ALL files (core runtime + packages) so the automatic build only needs
+to fetch ~25MB of core files.
 
 Usage in GitLab CI (uses CI_JOB_TOKEN automatically):
-    python scripts/upload_pyodide_packages.py
+    python scripts/upload_pyodide_packages.py --pyodide-version 0.27.7
 
 Usage locally:
     GITLAB_TOKEN=glpat-xxx GITLAB_URL=https://gitlab.example.com \\
     GITLAB_PROJECT_ID=123 \\
-    python scripts/upload_pyodide_packages.py
+    python scripts/upload_pyodide_packages.py --pyodide-version 0.27.7
 
 After uploading, configure pip.conf:
     [pyodide]
-    cdn-url = https://gitlab.example.com/api/v4/projects/123/packages/generic/pyodide/0.27.7
+    cdn-url = https://gitlab.example.com/api/v4/projects/123/packages/generic/pyodide/0.27.7/
 
-Then run the build with --slim:
-    python scripts/build.py --mode edit --slim
+Then run the build (no --slim needed):
+    python scripts/build.py --mode edit
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -33,28 +35,22 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Import shared functions from build.py
+sys.path.insert(0, str(Path(__file__).parent))
+from build import (
+    download,
+    download_marimo_base,
+    resolve_and_download_packages,
+    _load_pyodide_lock,
+    _save_pyodide_lock,
+    parse_requirements_in,
+    MARIMO_VERSION,
+)
 
-def _read_pyodide_version_from_build():
-    """Try to detect the Pyodide version from MARIMO_VERSION in build.py.
 
-    Falls back to None if detection fails.
-    """
-    build_py = Path(__file__).parent / "build.py"
-    if not build_py.exists():
-        return None
-
-    text = build_py.read_text()
-
-    # Extract MARIMO_VERSION
-    m = re.search(r'MARIMO_VERSION\s*=\s*"([^"]+)"', text)
-    if not m:
-        return None
-
-    marimo_version = m.group(1)
-
-    # Try to get Pyodide version from marimo's known mapping
-    # For now, ask the user to provide it or read from env
-    return None
+def _read_marimo_version():
+    """Read MARIMO_VERSION from build.py."""
+    return MARIMO_VERSION
 
 
 def _detect_gitlab_config():
@@ -79,46 +75,6 @@ def _detect_gitlab_config():
         token_header = "PRIVATE-TOKEN"
 
     return api_url, project_id, token, token_header
-
-
-def _download_with_proxy(url, dest):
-    """Download a URL, using proxy from pip.conf if available."""
-    import configparser
-
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    if dest.exists():
-        print(f"  Already exists: {dest.name}")
-        return
-
-    print(f"  Downloading: {url}")
-    req = urllib.request.Request(url)
-
-    # Check pip.conf for proxy settings
-    pip_conf = Path("pip.conf")
-    opener = None
-    if pip_conf.exists():
-        cfg = configparser.ConfigParser()
-        cfg.read(pip_conf)
-        proxy = cfg.get("global", "proxy", fallback=None)
-        if proxy:
-            handler = urllib.request.ProxyHandler(
-                {"http": proxy, "https": proxy}
-            )
-            opener = urllib.request.build_opener(handler)
-
-    try:
-        if opener:
-            resp = opener.open(req)
-        else:
-            resp = urllib.request.urlopen(req)
-        with resp:
-            data = resp.read()
-        dest.write_bytes(data)
-    except urllib.error.HTTPError as e:
-        print(f"  Failed to download {url}: {e}")
-        raise
 
 
 def _upload_file(api_url, project_id, token, token_header,
@@ -159,48 +115,64 @@ def _upload_file(api_url, project_id, token, token_header,
         return False
 
 
-def _list_package_files(pyodide_dir):
-    """List all package files (wheels, tarballs, zips) in the Pyodide directory.
+def _list_uploadable_files(pyodide_dir):
+    """List all files in the Pyodide directory suitable for upload.
 
-    Returns a list of Path objects, excluding core runtime files.
+    Returns a list of Path objects.  Excludes dotfiles and TypeScript
+    definitions (not needed at runtime).
     """
-    # Core runtime files that should NOT be uploaded (they stay on Pages)
-    # These are loaded via indexURL, not through pyodide-lock.json
-    core_patterns = {
-        "pyodide.asm.wasm", "pyodide.asm.js",
-        "pyodide.mjs", "pyodide.js",
-        "pyodide-lock.json",
-        "python_stdlib.zip",
-        "pyodide.d.ts", "pyodide.d.mts",
-        "ffi.d.ts",
-        "repodata.json",
-    }
-
-    package_files = []
+    skip_suffixes = {".d.ts", ".d.mts"}
+    files = []
     for f in sorted(pyodide_dir.iterdir()):
         if not f.is_file():
             continue
-        if f.name in core_patterns:
-            continue
         if f.name.startswith("."):
             continue
-        # Package files are .whl, .tar, .zip, or other data files
-        # Include everything that's not a core runtime file
-        if f.suffix in (".whl", ".tar", ".zip", ".gz", ".bz2"):
-            package_files.append(f)
-        elif f.name.endswith(".tar.gz") or f.name.endswith(".tar.bz2"):
-            package_files.append(f)
+        if any(f.name.endswith(s) for s in skip_suffixes):
+            continue
+        files.append(f)
+    return files
 
-    return package_files
+
+def _rewrite_lock_urls(pyodide_dir, registry_base_url):
+    """Rewrite every package file_name in pyodide-lock.json to an absolute registry URL.
+
+    Core runtime files (pyodide.mjs, etc.) are NOT packages and are not affected.
+    """
+    lock_path = pyodide_dir / "pyodide-lock.json"
+    if not lock_path.exists():
+        print("  ⚠ pyodide-lock.json not found — skipping URL rewrite")
+        return
+
+    lock_data = json.loads(lock_path.read_text())
+    base = registry_base_url.rstrip("/")
+    rewritten = 0
+
+    for pkg_key, entry in lock_data.get("packages", {}).items():
+        file_name = entry.get("file_name", "")
+        if not file_name:
+            continue
+        # Already absolute — skip
+        if file_name.startswith("http://") or file_name.startswith("https://"):
+            continue
+        entry["file_name"] = f"{base}/{file_name}"
+        rewritten += 1
+
+    lock_path.write_text(json.dumps(lock_data, indent=2))
+    print(f"  ✓ Rewrote {rewritten} package URLs in pyodide-lock.json")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Upload Pyodide packages to a GitLab Generic Package Registry"
+        description="Upload Pyodide distribution to a GitLab Generic Package Registry"
     )
     parser.add_argument(
         "--pyodide-version", required=True,
         help="Pyodide version to download and upload (e.g. 0.27.7)"
+    )
+    parser.add_argument(
+        "--marimo-version", default=None,
+        help=f"marimo version for marimo-base wheel (default: {MARIMO_VERSION})"
     )
     parser.add_argument(
         "--package-name", default="pyodide",
@@ -217,6 +189,7 @@ def main():
     args = parser.parse_args()
 
     pyodide_version = args.pyodide_version
+    marimo_version = args.marimo_version or _read_marimo_version()
 
     # Resolve GitLab connection
     api_url, project_id, token, token_header = _detect_gitlab_config()
@@ -237,13 +210,14 @@ def main():
             sys.exit(1)
 
     print(f"Pyodide version: {pyodide_version}")
+    print(f"marimo version:  {marimo_version}")
     if not args.dry_run:
         print(f"GitLab API:      {api_url}")
         print(f"Project ID:      {project_id}")
         print(f"Auth:            {token_header}")
     print()
 
-    # Get the Pyodide directory
+    # --- Step 1: Get the Pyodide directory ---
     if args.from_dir:
         pyodide_dir = Path(args.from_dir)
         if not pyodide_dir.is_dir():
@@ -262,7 +236,7 @@ def main():
         tarball_path = Path(tmp_dir) / f"pyodide-{pyodide_version}.tar.bz2"
 
         print("Downloading Pyodide distribution...")
-        _download_with_proxy(tarball_url, tarball_path)
+        download(tarball_url, tarball_path, retries=10)
 
         print("Extracting...")
         with tarfile.open(tarball_path, "r:bz2") as tar:
@@ -287,22 +261,52 @@ def main():
         print(f"Error: Pyodide directory not found at {pyodide_dir}")
         sys.exit(1)
 
-    # List package files
-    package_files = _list_package_files(pyodide_dir)
-    if not package_files:
-        print("No package files found to upload.")
+    # --- Step 2: Add marimo-base wheel ---
+    print("\nAdding marimo-base wheel...")
+    # download_marimo_base expects output_dir (parent of pyodide/)
+    output_dir = pyodide_dir.parent
+    download_marimo_base(str(output_dir), marimo_version)
+
+    # --- Step 3: Add extra wheels from requirements-wasm-extras.in ---
+    req_file = Path("requirements-wasm-extras.in")
+    if req_file.exists():
+        requirements = parse_requirements_in(req_file)
+        if requirements:
+            print(f"\nAdding {len(requirements)} extra packages...")
+            resolve_and_download_packages(str(output_dir), requirements)
+    else:
+        print("\nNo requirements-wasm-extras.in found — skipping extras")
+
+    # --- Step 4: Rewrite lock file with registry URLs ---
+    if not args.dry_run:
+        registry_base_url = (
+            f"{api_url}/projects/{project_id}/packages/generic/"
+            f"{args.package_name}/{pyodide_version}"
+        )
+    else:
+        registry_base_url = (
+            f"https://gitlab.example.com/api/v4/projects/PROJECT/packages/generic/"
+            f"{args.package_name}/{pyodide_version}"
+        )
+    print(f"\nRewriting pyodide-lock.json with registry URLs...")
+    _rewrite_lock_urls(pyodide_dir, registry_base_url)
+
+    # --- Step 5: List and upload all files ---
+    upload_files = _list_uploadable_files(pyodide_dir)
+    if not upload_files:
+        print("No files found to upload.")
         sys.exit(1)
 
-    total_size = sum(f.stat().st_size for f in package_files)
-    print(f"Found {len(package_files)} package files ({total_size / (1024*1024):.1f} MB)")
+    total_size = sum(f.stat().st_size for f in upload_files)
+    print(f"\nFound {len(upload_files)} files ({total_size / (1024*1024):.1f} MB)")
     print()
 
     # Upload
     uploaded = 0
     failed = 0
-    for i, file_path in enumerate(package_files, 1):
+    for i, file_path in enumerate(upload_files, 1):
         size_mb = file_path.stat().st_size / (1024 * 1024)
-        prefix = f"  [{i}/{len(package_files)}]"
+        prefix = f"  [{i}/{len(upload_files)}]"
 
         if args.dry_run:
             print(f"{prefix} {file_path.name} ({size_mb:.2f} MB)")
@@ -339,11 +343,10 @@ def main():
         print("  [pyodide]")
         print(f"  cdn-url = {registry_url}/")
         print()
-        print("Then build with: python scripts/build.py --mode edit --slim")
+        print("Then build with: python scripts/build.py --mode edit")
 
     # Cleanup temp directory
     if cleanup:
-        import shutil
         shutil.rmtree(cleanup, ignore_errors=True)
 
     sys.exit(1 if failed > 0 else 0)

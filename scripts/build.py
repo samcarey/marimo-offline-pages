@@ -7,7 +7,7 @@ Exports marimo notebooks to WASM HTML, downloads all external dependencies
 local paths. The result is a fully self-contained static site.
 
 Usage:
-    python scripts/build.py [--notebooks-dir notebooks] [--output-dir _site]
+    python scripts/build.py [--notebooks-dir notebooks] [--output-dir _site] [--mode edit]
 """
 
 import argparse
@@ -284,12 +284,25 @@ def detect_pyodide_version(output_dir):
 # Step 3: Download Pyodide
 # ---------------------------------------------------------------------------
 
-def download_pyodide(version, output_dir):
-    """Download the full Pyodide distribution and extract it."""
-    print("\n══════════════════════════════════════════")
-    print(f"Step 3: Downloading Pyodide {version}")
-    print("══════════════════════════════════════════")
+PYODIDE_CORE_FILES = [
+    "pyodide.mjs", "pyodide.js",
+    "pyodide.asm.wasm", "pyodide.asm.js",
+    "python_stdlib.zip", "pyodide-lock.json",
+]
 
+
+def download_pyodide_from_registry(version, output_dir, cdn_url):
+    """Download only core Pyodide runtime files from a package registry."""
+    pyodide_dir = Path(output_dir) / "pyodide"
+    pyodide_dir.mkdir(parents=True, exist_ok=True)
+    for filename in PYODIDE_CORE_FILES:
+        download(f"{cdn_url.rstrip('/')}/{filename}", pyodide_dir / filename)
+    print(f"  ✓ Pyodide core files downloaded to {pyodide_dir}")
+    return pyodide_dir
+
+
+def download_pyodide_tarball(version, output_dir):
+    """Download the full Pyodide distribution tarball and extract it."""
     pyodide_dir = Path(output_dir) / "pyodide"
 
     # Check if already downloaded
@@ -332,8 +345,43 @@ def download_pyodide(version, output_dir):
     return pyodide_dir
 
 
+def download_pyodide(version, output_dir):
+    """Download Pyodide — from registry (core only) or full tarball.
+
+    Returns ``(pyodide_dir, using_registry)``.
+    """
+    print("\n══════════════════════════════════════════")
+    print(f"Step 3: Downloading Pyodide {version}")
+    print("══════════════════════════════════════════")
+
+    pyodide_dir = Path(output_dir) / "pyodide"
+
+    # Check if already downloaded
+    if (pyodide_dir / "pyodide.mjs").exists() or (pyodide_dir / "pyodide.js").exists():
+        print(f"  ✓ Pyodide already present at {pyodide_dir}")
+        # Determine mode from lock file contents
+        lock_path = pyodide_dir / "pyodide-lock.json"
+        if lock_path.exists():
+            lock_data = json.loads(lock_path.read_text())
+            for entry in lock_data.get("packages", {}).values():
+                fn = entry.get("file_name", "")
+                if fn.startswith("http://") or fn.startswith("https://"):
+                    return pyodide_dir, True
+        return pyodide_dir, False
+
+    cdn_url = _get_pyodide_cdn_url(version)
+    default_cdn = f"https://cdn.jsdelivr.net/pyodide/v{version}/full"
+    if cdn_url != default_cdn:
+        # Registry: fetch only core files (~25MB)
+        print(f"  Registry URL: {cdn_url}")
+        return download_pyodide_from_registry(version, output_dir, cdn_url), True
+    else:
+        # No registry: full tarball (GitHub/development)
+        return download_pyodide_tarball(version, output_dir), False
+
+
 # ---------------------------------------------------------------------------
-# Step 3b: Strip bundled Pyodide packages (--slim mode)
+# Step 3b: Strip bundled Pyodide packages
 # ---------------------------------------------------------------------------
 
 def _get_pyodide_cdn_url(pyodide_version):
@@ -363,7 +411,7 @@ def strip_pyodide_packages(output_dir, pyodide_version):
     downloaded and registered later by the existing download_wasm_extras() flow.
     """
     print("\n══════════════════════════════════════════")
-    print("Step 3b: Stripping bundled Pyodide packages (--slim)")
+    print("Step 3b: Stripping bundled Pyodide packages")
     print("══════════════════════════════════════════")
 
     pyodide_dir = Path(output_dir) / "pyodide"
@@ -1866,35 +1914,6 @@ def download_wasm_extras(output_dir):
     resolve_and_download_packages(output_dir, requirements)
 
 
-def patch_micropip_for_offline(output_dir):
-    """
-    Patch micropip configuration so packages are loaded from the local
-    Pyodide distribution rather than fetching from PyPI.
-
-    The Pyodide 'full' distribution includes most scientific packages.
-    For additional packages, wheels should be placed in the pyodide/ directory
-    and the pyodide-lock.json should be updated.
-    """
-    print("\n══════════════════════════════════════════")
-    print("Step 7: Configuring offline package loading")
-    print("══════════════════════════════════════════")
-
-    pyodide_lock = Path(output_dir) / "pyodide" / "pyodide-lock.json"
-    if pyodide_lock.exists():
-        print(f"  ✓ pyodide-lock.json present — bundled packages will load locally")
-    else:
-        print(f"  ⚠ pyodide-lock.json not found — package loading may fail offline")
-
-    # Check if marimo itself is available as a wheel or needs to be added
-    # marimo is typically loaded by the WASM export's own assets, not via micropip
-    print("  ℹ The Pyodide 'full' distribution includes numpy, scipy, pandas,")
-    print("    matplotlib, scikit-learn, and many more. If your notebook imports")
-    print("    a package NOT in the Pyodide distribution, you'll need to:")
-    print("    1. Download its .whl file (pure Python wheel)")
-    print("    2. Place it in _site/pyodide/")
-    print("    3. Add an entry to pyodide-lock.json")
-    print("    See: https://pyodide.org/en/stable/usage/loading-packages.html")
-
 
 def _find_runpython_insertion(text):
     """Find the Pyodide instance variable and correct insertion point.
@@ -1924,7 +1943,7 @@ def _find_runpython_insertion(text):
 
 
 def inject_micropip_index(output_dir):
-    """Configure micropip to use a custom PyPI index with fallback (--slim mode).
+    """Configure micropip to use a custom PyPI index with fallback.
 
     When a custom index-url is configured in pip.conf, this patches worker-*.js
     to call ``micropip.set_index_urls()`` with the custom index first and
@@ -1932,7 +1951,7 @@ def inject_micropip_index(output_dir):
     default (pypi.org) is used and no patching is needed.
     """
     print("\n══════════════════════════════════════════")
-    print("Step 7: Configuring micropip index (--slim)")
+    print("Step 7: Configuring micropip index")
     print("══════════════════════════════════════════")
 
     index_url = _get_pypi_index_url()
@@ -2162,7 +2181,7 @@ _REQUIRED_MARKERS = [
 ]
 
 
-def verify_build(output_dir, slim=False):
+def verify_build(output_dir):
     """Scan the built site for leftover CDN URLs and missing patch markers.
 
     Any problem is recorded via ``patch_error`` so the build fails with a
@@ -2287,8 +2306,8 @@ def verify_build(output_dir, slim=False):
     else:
         patch_error("verify-packages", "pyodide-lock.json not found")
 
-    # --- Slim mode: verify lock file has absolute URLs for stripped packages ---
-    if slim and lock_path.exists():
+    # --- Verify lock file has absolute URLs for stripped/remote packages ---
+    if lock_path.exists():
         lock_data = json.loads(lock_path.read_text())
         packages = lock_data.get("packages", {})
         local_count = 0
@@ -2299,12 +2318,8 @@ def verify_build(output_dir, slim=False):
                 remote_count += 1
             else:
                 local_count += 1
-        if remote_count == 0:
-            patch_error("verify-slim",
-                        "Slim mode active but no packages have absolute CDN "
-                        "URLs in pyodide-lock.json — stripping may have failed")
-        else:
-            print(f"  ✓ Slim mode: {local_count} local, {remote_count} remote packages")
+        if remote_count > 0:
+            print(f"  ✓ Package sources: {local_count} local, {remote_count} remote")
 
     print()
 
@@ -2655,11 +2670,6 @@ def main():
         "--pyodide-version", default=None,
         help="Override Pyodide version (auto-detected from exports by default)"
     )
-    parser.add_argument(
-        "--slim", action="store_true",
-        help="Strip bundled Pyodide packages for semi-offline deployment. "
-             "Core runtime is served locally; packages load from CDN/PyPI on demand."
-    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -2688,10 +2698,10 @@ def main():
         pyodide_version = detect_pyodide_version(output_dir)
 
     # Step 3: Download Pyodide
-    download_pyodide(pyodide_version, output_dir)
+    pyodide_dir, using_registry = download_pyodide(pyodide_version, output_dir)
 
-    # Step 3b: Strip bundled packages (--slim mode)
-    if args.slim:
+    # Step 3b: Strip bundled packages (always when using tarball)
+    if not using_registry:
         strip_pyodide_packages(output_dir, pyodide_version)
 
     # Step 4: Download Google Fonts
@@ -2723,17 +2733,14 @@ def main():
     # Check patch errors before proceeding to downloads (fail fast)
     check_patch_errors()
 
-    # Step 6b: Download marimo-base for WASM support
-    download_marimo_base(output_dir, marimo_version)
+    # Step 6b/6c: Download wheels only when NOT using registry
+    # (registry path: lock file already has absolute URLs from upload job)
+    if not using_registry:
+        download_marimo_base(output_dir, marimo_version)
+        download_wasm_extras(output_dir)
 
-    # Step 6c: Download extra packages from requirements-wasm-extras.in
-    download_wasm_extras(output_dir)
-
-    # Step 7: Configure package loading
-    if args.slim:
-        inject_micropip_index(output_dir)
-    else:
-        patch_micropip_for_offline(output_dir)
+    # Step 7: Configure micropip index
+    inject_micropip_index(output_dir)
 
     # Step 11c: Inject repo file loader into worker JS
     inject_repo_file_loader(output_dir)
@@ -2754,7 +2761,7 @@ def main():
     rehash_patched_assets(output_dir)
 
     # Step 10: Verify the build
-    verify_build(output_dir, slim=args.slim)
+    verify_build(output_dir)
     check_patch_errors()
 
     # Summary
