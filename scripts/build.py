@@ -105,8 +105,11 @@ def _has_curl():
     return shutil.which("curl") is not None
 
 
-def download(url, dest, user_agent=None, retries=5):
-    """Download a URL to a local path, using curl when available."""
+def download(url, dest, user_agent=None, retries=5, headers=None):
+    """Download a URL to a local path, using curl when available.
+
+    *headers* is an optional dict of HTTP headers (e.g. auth tokens).
+    """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
@@ -124,6 +127,8 @@ def download(url, dest, user_agent=None, retries=5):
         ]
         if user_agent:
             cmd += ["-A", user_agent]
+        for key, val in (headers or {}).items():
+            cmd += ["-H", f"{key}: {val}"]
         cmd.append(url)
         # Retry at the Python level so each attempt gets a fresh
         # redirect chain (GitHub's signed CDN URLs are ephemeral).
@@ -150,6 +155,8 @@ def download(url, dest, user_agent=None, retries=5):
         req = urllib.request.Request(url)
         if user_agent:
             req.add_header("User-Agent", user_agent)
+        for key, val in (headers or {}).items():
+            req.add_header(key, val)
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:
                 with open(tmp, "wb") as f:
@@ -291,12 +298,31 @@ PYODIDE_CORE_FILES = [
 ]
 
 
+def _get_registry_auth_headers():
+    """Return HTTP auth headers for GitLab Package Registry downloads.
+
+    Uses CI_JOB_TOKEN in GitLab CI, or GITLAB_TOKEN / PRIVATE_TOKEN locally.
+    Returns an empty dict if no credentials are available.
+    """
+    token = os.environ.get("CI_JOB_TOKEN")
+    if token:
+        return {"JOB-TOKEN": token}
+    token = os.environ.get("GITLAB_TOKEN") or os.environ.get("PRIVATE_TOKEN")
+    if token:
+        return {"PRIVATE-TOKEN": token}
+    return {}
+
+
 def download_pyodide_from_registry(version, output_dir, cdn_url):
     """Download only core Pyodide runtime files from a package registry."""
     pyodide_dir = Path(output_dir) / "pyodide"
     pyodide_dir.mkdir(parents=True, exist_ok=True)
+    auth = _get_registry_auth_headers()
+    if auth:
+        print(f"  Auth: {list(auth.keys())[0]}")
     for filename in PYODIDE_CORE_FILES:
-        download(f"{cdn_url.rstrip('/')}/{filename}", pyodide_dir / filename)
+        download(f"{cdn_url.rstrip('/')}/{filename}", pyodide_dir / filename,
+                 headers=auth)
     print(f"  ✓ Pyodide core files downloaded to {pyodide_dir}")
     return pyodide_dir
 
