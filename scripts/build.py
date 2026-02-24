@@ -119,11 +119,11 @@ def download(url, dest, user_agent=None, retries=3):
     if _has_curl():
         cmd = [
             "curl", "-fSL",
+            "-C", "-",             # resume partial downloads
             "--retry", str(retries),
             "--retry-delay", "5",
             "--retry-all-errors",
             "--connect-timeout", "30",
-            "--max-time", "600",
             "-o", str(dest),
         ]
         if user_agent:
