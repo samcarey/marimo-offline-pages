@@ -105,7 +105,7 @@ def _has_curl():
     return shutil.which("curl") is not None
 
 
-def download(url, dest, user_agent=None, retries=3):
+def download(url, dest, user_agent=None, retries=5):
     """Download a URL to a local path, using curl when available."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -119,17 +119,29 @@ def download(url, dest, user_agent=None, retries=3):
     if _has_curl():
         cmd = [
             "curl", "-fSL",
-            "-C", "-",             # resume partial downloads
-            "--retry", str(retries),
-            "--retry-delay", "5",
-            "--retry-all-errors",
             "--connect-timeout", "30",
             "-o", str(dest),
         ]
         if user_agent:
             cmd += ["-A", user_agent]
         cmd.append(url)
-        subprocess.run(cmd, check=True)
+        # Retry at the Python level so each attempt gets a fresh
+        # redirect chain (GitHub's signed CDN URLs are ephemeral).
+        for attempt in range(1, retries + 1):
+            result = subprocess.run(cmd)
+            if result.returncode == 0:
+                return
+            # Remove partial file before retrying
+            if dest.exists():
+                dest.unlink()
+            if attempt < retries:
+                wait = 10 * attempt
+                print(f"  ⚠ curl attempt {attempt}/{retries} failed"
+                      f" (exit {result.returncode}), retrying in {wait}s …")
+                time.sleep(wait)
+            else:
+                raise RuntimeError(
+                    f"Download failed after {retries} attempts: {url}")
         return
 
     # Fallback: urllib with manual retry
