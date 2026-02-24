@@ -121,7 +121,7 @@ def download(url, dest, user_agent=None, retries=5, headers=None):
 
     if _has_curl():
         cmd = [
-            "curl", "-fSL",
+            "curl", "-fSL", "-C", "-",
             "--connect-timeout", "30",
             "-o", str(dest),
         ]
@@ -132,19 +132,33 @@ def download(url, dest, user_agent=None, retries=5, headers=None):
         cmd.append(url)
         # Retry at the Python level so each attempt gets a fresh
         # redirect chain (GitHub's signed CDN URLs are ephemeral).
+        # Partial files are kept so -C - can resume where it left off.
         for attempt in range(1, retries + 1):
             result = subprocess.run(cmd)
             if result.returncode == 0:
                 return
-            # Remove partial file before retrying
-            if dest.exists():
-                dest.unlink()
+            # Exit 33 = HTTP range error.  When resuming a fully-
+            # downloaded file the server returns 416; curl sees this
+            # as a range error.  Accept the file if it exists.
+            if result.returncode == 33 and dest.exists() \
+                    and dest.stat().st_size > 0:
+                print(f"  ℹ File already complete "
+                      f"({dest.stat().st_size / (1024*1024):.1f} MB)")
+                return
+            # Keep partial file — next attempt resumes with -C -
             if attempt < retries:
+                partial = ""
+                if dest.exists():
+                    partial = (f" ({dest.stat().st_size / (1024*1024):.0f}"
+                               f" MB so far)")
                 wait = 10 * attempt
                 print(f"  ⚠ curl attempt {attempt}/{retries} failed"
-                      f" (exit {result.returncode}), retrying in {wait}s …")
+                      f" (exit {result.returncode}){partial},"
+                      f" resuming in {wait}s …")
                 time.sleep(wait)
             else:
+                if dest.exists():
+                    dest.unlink()
                 raise RuntimeError(
                     f"Download failed after {retries} attempts: {url}")
         return
