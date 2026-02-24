@@ -86,8 +86,9 @@ function startOAuth() {
 
   sessionStorage.setItem('_launch_oauth_state', state);
   sessionStorage.setItem('_launch_oauth_verifier', codeVerifier);
-  // Preserve launch params across redirect
+  // Preserve launch params and hash fragment across redirect
   sessionStorage.setItem('_launch_params', window.location.search);
+  sessionStorage.setItem('_launch_hash', window.location.hash);
 
   var redirectUri = window.location.href.split('?')[0].split('#')[0];
   sessionStorage.setItem('_launch_redirect_uri', redirectUri);
@@ -111,9 +112,10 @@ async function handleOAuthCallback() {
   var state = cbParams.get('state');
   if (!code) return false;
 
-  // Clean URL
+  // Clean URL (restore original params and hash fragment)
   history.replaceState(null, '', window.location.pathname +
-    (sessionStorage.getItem('_launch_params') || ''));
+    (sessionStorage.getItem('_launch_params') || '') +
+    (sessionStorage.getItem('_launch_hash') || ''));
 
   // Restore launch params
   var restored = sessionStorage.getItem('_launch_params');
@@ -169,6 +171,7 @@ async function handleOAuthCallback() {
   sessionStorage.removeItem('_launch_oauth_verifier');
   sessionStorage.removeItem('_launch_redirect_uri');
   sessionStorage.removeItem('_launch_params');
+  sessionStorage.removeItem('_launch_hash');
   return true;
 }
 
@@ -344,9 +347,12 @@ async function launch() {
     }
   }
 
-  // Redirect to the notebook, preserving project context in the URL
+  // Redirect to the notebook, preserving project context and hash fragment
   setStatus('Launching notebook&hellip;');
   var dest = 'index.html?project=' + encodeURIComponent(PROJECT) + '&ref=' + encodeURIComponent(REF);
+  // Preserve #code/… hash from the original URL (carried via sessionStorage or current URL)
+  var launchHash = window.location.hash || sessionStorage.getItem('_launch_hash') || '';
+  if (launchHash) dest += launchHash;
   window.location.href = dest;
 }
 
