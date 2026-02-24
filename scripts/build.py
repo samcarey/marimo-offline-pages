@@ -15,7 +15,9 @@ import configparser
 import glob
 import gzip
 import hashlib
+import http.client
 import io
+import time
 import json
 import os
 import re
@@ -98,8 +100,8 @@ def run(cmd, **kwargs):
     return result
 
 
-def download(url, dest, user_agent=None):
-    """Download a URL to a local path."""
+def download(url, dest, user_agent=None, retries=3):
+    """Download a URL to a local path, with retry on transient failures."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
@@ -108,16 +110,36 @@ def download(url, dest, user_agent=None):
 
     print(f"  ↓ Downloading: {url}")
     print(f"    → {dest}")
-    req = urllib.request.Request(url)
-    if user_agent:
-        req.add_header("User-Agent", user_agent)
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = resp.read()
-        dest.write_bytes(data)
-    except urllib.error.HTTPError as e:
-        print(f"  ✗ Failed to download {url}: {e}")
-        raise
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request(url)
+        if user_agent:
+            req.add_header("User-Agent", user_agent)
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = resp.read(1 << 20)  # 1 MB chunks
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            tmp.rename(dest)
+            return
+        except urllib.error.HTTPError:
+            if tmp.exists():
+                tmp.unlink()
+            raise
+        except (http.client.IncompleteRead, urllib.error.URLError, OSError) as e:
+            if tmp.exists():
+                tmp.unlink()
+            if attempt < retries:
+                wait = 5 * attempt
+                print(f"  ⚠ Attempt {attempt}/{retries} failed: {e}")
+                print(f"    Retrying in {wait}s …")
+                time.sleep(wait)
+            else:
+                print(f"  ✗ Failed after {retries} attempts: {url}")
+                raise
 
 
 def download_text(url, user_agent=None):
