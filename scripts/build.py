@@ -2572,6 +2572,7 @@ def patch_index_for_launcher(output_dir):
         # after the worker finishes loading data files.
         refresh_script = (
             '\n<script>'
+            'if(new URLSearchParams(window.location.search).has("project")){'
             'try{var _bc=new BroadcastChannel("_marimo_launcher");'
             '_bc.onmessage=function(ev){_bc.close();'
             'if(ev.data==="auth_expired"){'
@@ -2584,6 +2585,7 @@ def patch_index_for_launcher(output_dir):
             'if(b)b.click();'
             '},500)};'
             '}catch(e){}'
+            '}'
             '</script>'
         )
         body_end = text.rfind('</body>')
