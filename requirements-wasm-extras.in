@@ -3,10 +3,14 @@
 # Only pure-Python wheels (py3-none-any) are supported.
 # Packages already bundled in Pyodide (numpy, pandas, etc.) are skipped automatically.
 #
+# The build queries all indexes configured in pip.conf (index-url,
+# extra-index-url) so private registry packages are supported.
+#
 # Supported formats:
 #   package-name
 #   package-name>=1.0
 #   package-name==1.2.3
+#   package-name[extra1,extra2]     # install with optional dependency groups
 #   git+https://gitlab.example.com/team/repo.git@v1.0
 #
 Markdown
@@ -15,3 +19,4 @@ tomlkit
 itsdangerous
 narwhals>=2.0
 humanize
+rfnb[plot]

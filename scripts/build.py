@@ -1493,6 +1493,34 @@ def _get_pypi_index_url():
     return "https://pypi.org"
 
 
+def _get_all_index_urls():
+    """Return all configured index URLs from pip.conf.
+
+    Returns a list of URLs.  The primary ``index-url`` comes first, then any
+    ``extra-index-url`` entries, and finally ``https://pypi.org`` as a fallback
+    (unless it was already listed).
+    """
+    urls = []
+    pip_conf = Path("pip.conf")
+    if pip_conf.exists():
+        cfg = configparser.ConfigParser()
+        cfg.read(pip_conf)
+        primary = cfg.get("global", "index-url", fallback=None)
+        if primary:
+            urls.append(primary.rstrip("/"))
+        extra = cfg.get("global", "extra-index-url", fallback=None)
+        if extra:
+            # May be a single URL or multiple (one per line)
+            for line in extra.splitlines():
+                line = line.strip()
+                if line:
+                    urls.append(line.rstrip("/"))
+    # Always include pypi.org as final fallback
+    if not any("pypi.org" in u for u in urls):
+        urls.append("https://pypi.org")
+    return urls if urls else ["https://pypi.org"]
+
+
 def _get_pypi_proxy_handler():
     """Return a urllib ProxyHandler if pip.conf specifies a proxy."""
     pip_conf = Path("pip.conf")
@@ -1515,6 +1543,140 @@ def _pypi_urlopen(url, timeout=30):
         opener = urllib.request.build_opener(handler)
         return opener.open(req, timeout=timeout)
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _parse_simple_index(html, name):
+    """Parse a PEP 503 Simple Repository API HTML response.
+
+    Returns a dict similar to ``pypi.org/pypi/{name}/json``: releases
+    grouped by version with filename, url, and sha256 for each wheel.
+    Only pure-Python wheels are included.
+    """
+    from html.parser import HTMLParser
+    from packaging.version import Version
+
+    class LinkParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.links = []   # (href, text)
+            self._href = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "a":
+                self._href = dict(attrs).get("href", "")
+
+        def handle_data(self, data):
+            if self._href is not None:
+                self.links.append((self._href, data.strip()))
+                self._href = None
+
+        def handle_endtag(self, tag):
+            if tag == "a":
+                self._href = None
+
+    parser = LinkParser()
+    parser.feed(html)
+
+    # Normalised name for matching wheel filenames
+    norm = re.sub(r"[-_.]+", "_", name).lower()
+
+    releases = {}  # version_str -> [wheel_info, ...]
+    for href, text in parser.links:
+        fname = text or href.rsplit("/", 1)[-1].split("#")[0]
+        if not fname.endswith(".whl"):
+            continue
+        # Only pure-Python wheels
+        if "py3-none-any" not in fname and "py2.py3-none-any" not in fname:
+            continue
+        # Parse version from wheel filename: name-version-tags.whl
+        # Normalise the filename prefix the same way
+        fname_norm = re.sub(r"[-_.]+", "_", fname.split("-")[0]).lower()
+        if fname_norm != norm:
+            continue
+        parts = fname.split("-")
+        if len(parts) < 3:
+            continue
+        ver_str = parts[1]
+        try:
+            Version(ver_str)  # validate
+        except Exception:
+            continue
+        # Extract sha256 from URL fragment
+        sha256 = ""
+        if "#sha256=" in href:
+            sha256 = href.split("#sha256=", 1)[1]
+        # Build absolute URL (href may be relative)
+        url = href.split("#")[0]
+        wheel_info = {"filename": fname, "url": url, "sha256": sha256}
+        releases.setdefault(ver_str, []).append(wheel_info)
+
+    # Build a structure compatible with _find_best_version
+    latest = None
+    if releases:
+        latest = str(max(releases.keys(), key=lambda v: Version(v)))
+    return {
+        "info": {"version": latest or "0"},
+        "releases": releases,
+    }
+
+
+def _fetch_from_simple_index(index_url, name):
+    """Fetch package metadata from a PEP 503 Simple Repository index.
+
+    Returns a dict compatible with _find_best_version, or None if the
+    package is not found on this index.
+    """
+    # Normalise name per PEP 503
+    norm_name = re.sub(r"[-_.]+", "-", name).lower()
+    # Ensure the URL ends with /simple/ pattern
+    base = index_url.rstrip("/")
+    if base.endswith("/simple"):
+        simple_url = f"{base}/{norm_name}/"
+    elif "/simple/" in base:
+        simple_url = f"{base}/{norm_name}/"
+    else:
+        simple_url = f"{base}/simple/{norm_name}/"
+
+    try:
+        with _pypi_urlopen(simple_url) as resp:
+            html = resp.read().decode("utf-8")
+        data = _parse_simple_index(html, name)
+        if data["releases"]:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_from_pypi_json(name):
+    """Fetch package metadata from pypi.org's JSON API.
+
+    Returns a dict compatible with _find_best_version, or None if not found.
+    """
+    try:
+        with _pypi_urlopen(f"https://pypi.org/pypi/{name}/json") as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _fetch_package_metadata(name):
+    """Fetch package metadata from all configured indexes.
+
+    Tries each index in order (index-url, extra-index-url, pypi.org fallback).
+    For pypi.org, uses the JSON API; for others, uses PEP 503 Simple API.
+    Returns ``(data, source_url)`` or ``(None, None)`` if not found anywhere.
+    """
+    for index_url in _get_all_index_urls():
+        if "pypi.org" in index_url:
+            data = _fetch_from_pypi_json(name)
+            if data:
+                return data, index_url
+        else:
+            data = _fetch_from_simple_index(index_url, name)
+            if data:
+                return data, index_url
+    return None, None
 
 
 def _pyodide_marker_env():
@@ -1663,11 +1825,18 @@ def _extract_wheel_metadata(wheel_path):
         return name, version, requires, imports
 
 
-def _filter_requires_dist(requires_dist):
+def _filter_requires_dist(requires_dist, extras=None):
     """Filter a Requires-Dist list down to dependencies needed in Pyodide.
 
-    Drops extras-only deps, platform-specific deps that don't match
-    emscripten/wasm32, and python_version markers < 3.12.
+    When *extras* is provided (e.g. ``{"all"}``), dependencies gated by
+    ``; extra == "all"`` markers are included.
+
+    Extras requested *on* the dependencies themselves (e.g. ``marimo[lsp]``)
+    are stripped — we install the base package only since micropip does not
+    support extras.
+
+    Drops platform-specific deps that don't match emscripten/wasm32 and
+    python_version markers < 3.12.
     """
     from packaging.requirements import Requirement
 
@@ -1678,12 +1847,26 @@ def _filter_requires_dist(requires_dist):
             req = Requirement(dep_str)
         except Exception:
             continue
-        # Skip if the marker doesn't match Pyodide's environment
-        if req.marker and not req.marker.evaluate(marker_env):
-            continue
-        # Skip extras (we never install with extras)
+        # Evaluate markers
+        if req.marker:
+            matched = False
+            # Check with base marker env (unconditional deps)
+            if req.marker.evaluate(marker_env):
+                matched = True
+            # Check with each requested extra
+            if not matched and extras:
+                for extra_name in extras:
+                    env = dict(marker_env)
+                    env["extra"] = extra_name
+                    if req.marker.evaluate(env):
+                        matched = True
+                        break
+            if not matched:
+                continue
+        # Strip extras from the dep itself (e.g. "marimo[lsp]" -> "marimo")
+        # micropip doesn't support extras, but we still want the base package
         if req.extras:
-            continue
+            req = Requirement(f"{req.name}{req.specifier}")
         result.append(req)
     return result
 
@@ -1773,8 +1956,12 @@ def _find_best_version(pypi_data, specifier=None):
     return candidates[0][1], candidates[0][2]
 
 
-def download_pypi_package(output_dir, name, specifier=None, visited=None):
+def download_pypi_package(output_dir, name, specifier=None, extras=None,
+                          visited=None):
     """Download a PyPI package and its transitive dependencies.
+
+    When *extras* is provided (e.g. ``{"all"}``), optional dependencies
+    gated by those extras are included.
 
     Returns ``True`` if the package was successfully handled, ``False`` on
     failure.  Populates *visited* to avoid processing the same package twice.
@@ -1799,21 +1986,15 @@ def download_pypi_package(output_dir, name, specifier=None, visited=None):
         visited[pkg_key] = bundled_ver
         return True
 
-    # Fetch from PyPI
-    index_url = _get_pypi_index_url()
-    # For custom indexes, fall back to standard simple API
-    if "pypi.org" in index_url:
-        pypi_url = f"https://pypi.org/pypi/{name}/json"
-    else:
-        # For custom indexes, try PyPI JSON API as fallback
-        pypi_url = f"https://pypi.org/pypi/{name}/json"
-
-    try:
-        with _pypi_urlopen(pypi_url) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"  ⚠ Failed to fetch PyPI metadata for {name}: {e}")
+    # Fetch metadata from all configured indexes
+    data, source = _fetch_package_metadata(name)
+    if data is None:
+        print(f"  ⚠ Failed to find {name} on any configured index")
         return False
+    if source:
+        # Only mention non-pypi sources
+        if "pypi.org" not in source:
+            print(f"  ℹ Found {name} on {source}")
 
     version, wheel_info = _find_best_version(data, specifier)
     if version is None or wheel_info is None:
@@ -1847,8 +2028,8 @@ def download_pypi_package(output_dir, name, specifier=None, visited=None):
     _register_wheel_in_lock(lock_data, lock_path, wheel_dest, name, version,
                             imports=imports)
 
-    # Resolve transitive dependencies
-    filtered_deps = _filter_requires_dist(requires_dist)
+    # Resolve transitive dependencies (pass extras only for this package)
+    filtered_deps = _filter_requires_dist(requires_dist, extras=extras)
     for dep_req in filtered_deps:
         dep_key = _pyodide_normalize(dep_req.name)
         if dep_key in visited:
@@ -1859,6 +2040,7 @@ def download_pypi_package(output_dir, name, specifier=None, visited=None):
             visited[dep_key] = "bundled"
             continue
         print(f"    ↳ Transitive dep: {dep_req.name}{dep_req.specifier or ''}")
+        # Transitive deps don't inherit extras
         download_pypi_package(
             output_dir, dep_req.name,
             specifier=dep_req.specifier if dep_req.specifier else None,
@@ -1913,15 +2095,16 @@ def resolve_and_download_packages(output_dir, requirements):
                     visited=visited,
                 )
         else:
-            # PyPI package (possibly with version specifier)
+            # PyPI package (possibly with version specifier and/or extras)
             try:
                 req = Requirement(req_str)
             except Exception as e:
                 print(f"  ⚠ Could not parse requirement '{req_str}': {e}")
                 continue
             spec = req.specifier if req.specifier else None
+            extras = req.extras if req.extras else None
             download_pypi_package(output_dir, req.name, specifier=spec,
-                                   visited=visited)
+                                   extras=extras, visited=visited)
 
 
 def download_wasm_extras(output_dir):
@@ -1984,20 +2167,26 @@ def inject_micropip_index(output_dir):
     print("Step 7: Configuring micropip index")
     print("══════════════════════════════════════════")
 
-    index_url = _get_pypi_index_url()
-    if "pypi.org" in index_url:
+    all_urls = _get_all_index_urls()
+    # Only custom (non-pypi) indexes need patching
+    custom_urls = [u for u in all_urls if "pypi.org" not in u]
+    if not custom_urls:
         print("  ℹ No custom PyPI index configured — micropip defaults to pypi.org")
         return
 
-    # Ensure the custom index URL ends with /simple/
-    simple_url = index_url.rstrip("/")
-    if not simple_url.endswith("/simple"):
-        simple_url += "/simple/"
-    else:
-        simple_url += "/"
+    # Build the URL list for micropip: custom indexes first, pypi.org last
+    micropip_urls = []
+    for url in custom_urls:
+        simple_url = url.rstrip("/")
+        if not simple_url.endswith("/simple"):
+            simple_url += "/simple/"
+        else:
+            simple_url += "/"
+        micropip_urls.append(simple_url)
+    micropip_urls.append("https://pypi.org/simple/")
 
-    print(f"  Custom index: {simple_url}")
-    print(f"  Fallback: https://pypi.org/simple/")
+    for u in micropip_urls:
+        print(f"  Index: {u}")
 
     patched = 0
     for path in Path(output_dir).rglob("*worker*.js"):
@@ -2009,11 +2198,14 @@ def inject_micropip_index(output_dir):
         if not instance_var:
             continue
 
+        # Build the URL list string
+        url_list = ",".join(f'\\"{u}\\"' for u in micropip_urls)
+
         # Use bracket notation so other injections' regex won't match this
         inject_code = (
             f'await {instance_var}["runPythonAsync"]('
             f"'import micropip;micropip.set_index_urls("
-            f'[\\"{simple_url}\\",\\"https://pypi.org/simple/\\"])'
+            f'[{url_list}])'
             f"');"
         )
 
