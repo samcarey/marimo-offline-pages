@@ -2128,6 +2128,51 @@ def download_wasm_extras(output_dir):
 
 
 
+def _find_load_pyodide_completion(text):
+    """Find the insertion point right after ``loadPyodide(...)`` completes.
+
+    Returns ``(instance_var, insert_pos)`` where *insert_pos* is right after
+    the semicolon that ends the ``VAR = await loadPyodide({...});`` statement.
+    This is the earliest safe point to inject micropip configuration — micropip
+    is already loaded (it's in loadPyodide's ``packages`` array) and no package
+    installation has happened yet.
+
+    Returns ``(None, None)`` if no match is found.
+    """
+    m = re.search(r'(\w+)\s*=\s*await\s+loadPyodide\s*\(', text)
+    if not m:
+        return None, None
+
+    instance_var = m.group(1)
+
+    # Count parentheses from the opening '(' to find the matching ')'
+    start = m.end() - 1  # position of the '('
+    depth = 0
+    i = start
+    while i < len(text):
+        if text[i] == '(':
+            depth += 1
+        elif text[i] == ')':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    else:
+        return None, None  # unbalanced parens
+
+    # Find the ';' that ends the statement
+    j = i + 1
+    while j < len(text) and text[j] in ' \t\n\r':
+        j += 1
+    if j < len(text) and text[j] == ';':
+        insert_pos = j + 1
+    else:
+        # No semicolon (minified code may omit it) — insert right after ')'
+        insert_pos = i + 1
+
+    return instance_var, insert_pos
+
+
 def _find_runpython_insertion(text):
     """Find the Pyodide instance variable and correct insertion point.
 
@@ -2194,16 +2239,24 @@ def inject_micropip_index(output_dir):
             continue  # Skip Pyodide's own files
         text = path.read_text(errors="ignore")
 
-        instance_var, insert_pos = _find_runpython_insertion(text)
+        # Prefer injecting right after loadPyodide() — earliest safe point
+        instance_var, insert_pos = _find_load_pyodide_completion(text)
+        method = "loadPyodide"
+        if not instance_var:
+            # Fallback to the old injection point (before first runPythonAsync)
+            instance_var, insert_pos = _find_runpython_insertion(text)
+            method = "runPythonAsync"
         if not instance_var:
             continue
 
         # Build the URL list string
         url_list = ",".join(f'\\"{u}\\"' for u in micropip_urls)
 
-        # Use bracket notation so other injections' regex won't match this
+        # Synchronous runPython — micropip is already loaded by loadPyodide's
+        # packages array, so no await needed.  This blocks until done,
+        # guaranteeing set_index_urls runs before any package installation.
         inject_code = (
-            f'await {instance_var}["runPythonAsync"]('
+            f'{instance_var}.runPython('
             f"'import micropip;micropip.set_index_urls("
             f'[{url_list}])'
             f"');"
@@ -2213,7 +2266,7 @@ def inject_micropip_index(output_dir):
         path.write_text(text)
         patched += 1
         print(f"  ✓ Injected micropip index config: {path}")
-        print(f"    instance={instance_var}")
+        print(f"    instance={instance_var}, method={method}")
 
     if patched == 0:
         print("  ⚠ No worker JS files found to patch for micropip index")
