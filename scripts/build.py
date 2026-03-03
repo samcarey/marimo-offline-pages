@@ -2214,34 +2214,45 @@ def _find_runpython_insertion(text):
 
 
 def inject_micropip_index(output_dir):
-    """Configure micropip to use a custom PyPI index with fallback.
+    """Configure micropip to use custom PyPI indexes with fallback.
 
-    When a custom index-url is configured in pip.conf, this patches worker-*.js
-    to call ``micropip.set_index_urls()`` with the custom index first and
-    public PyPI as fallback.  If no custom index is configured, micropip's
-    default (pypi.org) is used and no patching is needed.
+    Reads ``extra-index-url`` from pip.conf and patches worker-*.js to call
+    ``micropip.set_index_urls()`` with those URLs first and public PyPI as
+    fallback.
+
+    Only ``extra-index-url`` entries are included — NOT ``index-url``.  The
+    ``index-url`` is typically a corporate PyPI mirror (e.g. Nexus) that
+    serves the same packages as pypi.org.  In the browser, these mirrors are
+    often unreachable due to CORS / Private Network Access restrictions, and
+    micropip treats CORS errors as fatal (aborting before trying the next
+    URL).  Since pypi.org is always added as a fallback, the mirror is
+    redundant and omitting it avoids these fatal errors.
     """
     print("\n══════════════════════════════════════════")
     print("Step 7: Configuring micropip index")
     print("══════════════════════════════════════════")
 
-    all_urls = _get_all_index_urls()
-    # Only custom (non-pypi) indexes need patching
-    custom_urls = [u for u in all_urls if "pypi.org" not in u]
-    if not custom_urls:
-        print("  ℹ No custom PyPI index configured — micropip defaults to pypi.org")
+    # Read extra-index-url directly (skip index-url — it's a PyPI mirror
+    # that pypi.org already covers, and it may be CORS-blocked at runtime).
+    extra_urls = []
+    pip_conf = Path("pip.conf")
+    if pip_conf.exists():
+        cfg = configparser.ConfigParser()
+        cfg.read(pip_conf)
+        extra = cfg.get("global", "extra-index-url", fallback=None)
+        if extra:
+            for line in extra.splitlines():
+                line = line.strip()
+                if line and "pypi.org" not in line:
+                    extra_urls.append(line.rstrip("/"))
+
+    if not extra_urls:
+        print("  ℹ No extra-index-url configured — micropip defaults to pypi.org")
         return
 
-    # Build the URL list for micropip.
-    # Reverse the custom URL order: extra-index-url entries come before
-    # index-url.  In pip's semantics, index-url is the general PyPI mirror
-    # while extra-index-url holds private/additional registries.  At runtime
-    # in the browser, private registries (e.g. GitLab packages) are more
-    # likely to succeed (same infrastructure) than a general mirror that may
-    # be CORS-blocked.  Trying them first avoids fatal CORS errors that
-    # prevent micropip from reaching subsequent URLs.
+    # Build the URL list: private registries first, pypi.org last
     micropip_urls = []
-    for url in reversed(custom_urls):
+    for url in extra_urls:
         simple_url = url.rstrip("/")
         if not simple_url.endswith("/simple"):
             simple_url += "/simple"
