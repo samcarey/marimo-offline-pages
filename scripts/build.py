@@ -2137,9 +2137,22 @@ def _find_load_pyodide_completion(text):
     is already loaded (it's in loadPyodide's ``packages`` array) and no package
     installation has happened yet.
 
+    In minified builds, ``loadPyodide`` is aliased (e.g. ``Ro``, ``Mo``) via a
+    decorator like ``V(Ro, "loadPyodide")``.  We detect the alias from that
+    pattern, then find the actual call ``VAR = await ALIAS({packages:[...]});``.
+
     Returns ``(None, None)`` if no match is found.
     """
+    # Try direct (unminified) call first
     m = re.search(r'(\w+)\s*=\s*await\s+loadPyodide\s*\(', text)
+    if not m:
+        # Minified: find the alias via V(ALIAS,"loadPyodide") or U(ALIAS,...)
+        alias_m = re.search(r'\w+\((\w+),\s*[`"\']loadPyodide[`"\']\)', text)
+        if alias_m:
+            alias = alias_m.group(1)
+            m = re.search(
+                rf'(\w+)\s*=\s*await\s+{re.escape(alias)}\s*\(', text
+            )
     if not m:
         return None, None
 
