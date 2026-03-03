@@ -2232,16 +2232,21 @@ def inject_micropip_index(output_dir):
         print("  ℹ No custom PyPI index configured — micropip defaults to pypi.org")
         return
 
-    # Build the URL list for micropip: custom indexes first, pypi.org last
+    # Build the URL list for micropip.
+    # Reverse the custom URL order: extra-index-url entries come before
+    # index-url.  In pip's semantics, index-url is the general PyPI mirror
+    # while extra-index-url holds private/additional registries.  At runtime
+    # in the browser, private registries (e.g. GitLab packages) are more
+    # likely to succeed (same infrastructure) than a general mirror that may
+    # be CORS-blocked.  Trying them first avoids fatal CORS errors that
+    # prevent micropip from reaching subsequent URLs.
     micropip_urls = []
-    for url in custom_urls:
+    for url in reversed(custom_urls):
         simple_url = url.rstrip("/")
         if not simple_url.endswith("/simple"):
-            simple_url += "/simple/"
-        else:
-            simple_url += "/"
+            simple_url += "/simple"
         micropip_urls.append(simple_url)
-    micropip_urls.append("https://pypi.org/simple/")
+    micropip_urls.append("https://pypi.org/simple")
 
     for u in micropip_urls:
         print(f"  Index: {u}")
