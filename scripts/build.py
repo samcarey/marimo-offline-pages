@@ -2284,11 +2284,26 @@ def inject_micropip_index(output_dir):
         # Synchronous runPython — micropip is already loaded by loadPyodide's
         # packages array, so no await needed.  This blocks until done,
         # guaranteeing set_index_urls runs before any package installation.
+        #
+        # Also monkey-patch micropip.install to default keep_going=True.
+        # Private packages often have transitive deps with version constraints
+        # stricter than what Pyodide bundles (e.g. scipy>=1.15 when Pyodide
+        # has 1.14).  Without keep_going, micropip aborts the entire install
+        # because it can't find a pure Python wheel for the upgrade.  With
+        # keep_going, it skips those and the Pyodide-bundled version is used.
+        patch_py = (
+            '_oi=micropip.install\\n'
+            'async def _pi(*a,**k):\\n'
+            ' k.setdefault(\\"keep_going\\",True)\\n'
+            ' return await _oi(*a,**k)\\n'
+            'micropip.install=_pi'
+        )
         inject_code = (
             f'{instance_var}.runPython('
             f"'import micropip;micropip.set_index_urls("
             f'[{url_list}])'
             f"');"
+            f"{instance_var}.runPython('{patch_py}');"
         )
 
         text = text[:insert_pos] + inject_code + text[insert_pos:]
