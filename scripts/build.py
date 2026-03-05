@@ -211,30 +211,6 @@ def download_text(url, user_agent=None):
 # Step 1: Export notebooks
 # ---------------------------------------------------------------------------
 
-def _inject_app_config(notebook_path):
-    """Inject WASM-friendly config into marimo.App() if not already present.
-
-    Adds ``output_max_bytes`` so that large widget outputs (e.g. Cesium viewer)
-    are not rejected at runtime.  Modifies the file in place and returns the
-    original content so the caller can restore it after export.
-    """
-    text = Path(notebook_path).read_text()
-    if "output_max_bytes" in text:
-        return None  # already configured
-
-    # Match marimo.App( with optional existing kwargs
-    patched = re.sub(
-        r'marimo\.App\(',
-        'marimo.App(config={"runtime": {"output_max_bytes": 50_000_000}}, ',
-        text,
-        count=1,
-    )
-    if patched == text:
-        return None  # no marimo.App( found
-    Path(notebook_path).write_text(patched)
-    return text  # return original for restoration
-
-
 def export_notebooks(notebooks_dir, output_dir, mode="run"):
     """Export all marimo notebooks to WASM HTML."""
     print("\n══════════════════════════════════════════")
@@ -255,19 +231,8 @@ def export_notebooks(notebooks_dir, output_dir, mode="run"):
             out = Path(output_dir)
         else:
             out = Path(output_dir) / f"{name}"
-
-        # Temporarily inject WASM config before export
-        original = _inject_app_config(nb)
-        if original:
-            print(f"  ℹ Injected output_max_bytes config into {nb}")
-
         print(f"\n  Exporting {nb} → {out}/")
-        try:
-            run(f"marimo export html-wasm {nb} -o {out} --mode {mode} --force")
-        finally:
-            # Restore original notebook content
-            if original:
-                Path(nb).write_text(original)
+        run(f"marimo export html-wasm {nb} -o {out} --mode {mode} --force")
 
     return notebooks
 
