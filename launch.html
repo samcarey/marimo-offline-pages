@@ -349,7 +349,7 @@ async function launch() {
 
   // Redirect to the notebook, preserving project context and hash fragment
   setStatus('Launching notebook&hellip;');
-  var dest = 'index.html?project=' + encodeURIComponent(PROJECT) + '&ref=' + encodeURIComponent(REF);
+  var dest = '__VIEWER_PATH__?project=' + encodeURIComponent(PROJECT) + '&ref=' + encodeURIComponent(REF);
   // Preserve #code/… hash from the original URL (carried via sessionStorage or current URL)
   var launchHash = window.location.hash || sessionStorage.getItem('_launch_hash') || '';
   if (launchHash) dest += launchHash;

@@ -2685,12 +2685,16 @@ def _get_oauth_config():
     return client_id, gitlab_url
 
 
-def build_launch_page(output_dir):
+def build_launch_page(output_dir, notebooks):
     """Generate launch.html with OAuth config baked in (opt-in).
 
     Reads ``[oauth] client-id`` and ``[oauth] gitlab-url`` from pip.conf and
     replaces placeholders in the launch.html template.  If not configured the
     step is silently skipped.
+
+    The ``__VIEWER_PATH__`` placeholder is replaced with the path to a notebook
+    viewer page — ``index.html`` for single-notebook builds, or
+    ``<name>/index.html`` for multi-notebook builds.
     """
     print("\n══════════════════════════════════════════")
     print("Step 12: Building launch page (opt-in)")
@@ -2706,14 +2710,22 @@ def build_launch_page(output_dir):
         print("  ⚠ launch.html template not found at repo root — skipping")
         return
 
+    # Determine the viewer page path
+    if len(notebooks) == 1:
+        viewer_path = "index.html"
+    else:
+        viewer_path = f"{Path(notebooks[0]).stem}/index.html"
+
     html = template.read_text()
     html = html.replace("__OAUTH_CLIENT_ID__", client_id)
     html = html.replace("__GITLAB_URL__", gitlab_url)
+    html = html.replace("__VIEWER_PATH__", viewer_path)
 
     dest = Path(output_dir) / "launch.html"
     dest.write_text(html)
     print(f"  ✓ launch.html generated with client_id={client_id[:8]}…")
     print(f"    gitlab_url={gitlab_url}")
+    print(f"    viewer_path={viewer_path}")
 
 
 def build_create_page(output_dir):
@@ -2796,38 +2808,41 @@ def patch_index_for_launcher(output_dir):
     print("Step 11b: Patching index.html for launcher")
     print("══════════════════════════════════════════")
 
-    launcher_js = (
-        "// --- Launcher: load notebook from launch.html ---\n"
-        "      var _lp=new URLSearchParams(window.location.search);\n"
-        "      if(_lp.has('project')){\n"
-        "        var _lc=localStorage.getItem('_marimo_notebook');\n"
-        "        var _lt=localStorage.getItem('_marimo_oauth_token');\n"
-        "        if(!_lc || !_lt){\n"
-        "          window.location.href='launch.html'+window.location.search+window.location.hash;\n"
-        "          return;\n"
-        "        }\n"
-        "        // Update IndexedDB token so worker always has the freshest\n"
-        "        try{var _idb=indexedDB.open('_marimo_launcher',1);\n"
-        "        _idb.onupgradeneeded=function(){_idb.result.createObjectStore('config')};\n"
-        "        _idb.onsuccess=function(){var _d=_idb.result;\n"
-        "          var _tx=_d.transaction('config','readwrite');\n"
-        "          var _st=_tx.objectStore('config');\n"
-        "          var _g=_st.get('pending');\n"
-        "          _g.onsuccess=function(){if(_g.result){_g.result.token=_lt;_st.put(_g.result,'pending')}_d.close()};\n"
-        "          _g.onerror=function(){_d.close()};\n"
-        "        };}catch(e){}\n"
-        "        // Only overwrite <marimo-code> if no #code/ hash — otherwise\n"
-        "        // fall through to let the hash handler below remove it.\n"
-        "        var _hh=window.location.hash;\n"
-        "        if(!_hh||_hh.indexOf('#code/')!==0){\n"
-        "          var _el=document.querySelector('marimo-code');\n"
-        "          if(_el){_el.textContent=encodeURIComponent(_lc);}\n"
-        "        }\n"
-        "      }\n"
-    )
+    def _launcher_js(launch_path):
+        """Build the launcher JS snippet with the correct path to launch.html."""
+        return (
+            "// --- Launcher: load notebook from launch.html ---\n"
+            f"      var _lp=new URLSearchParams(window.location.search);\n"
+            f"      if(_lp.has('project')){{\n"
+            f"        var _lc=localStorage.getItem('_marimo_notebook');\n"
+            f"        var _lt=localStorage.getItem('_marimo_oauth_token');\n"
+            f"        if(!_lc || !_lt){{\n"
+            f"          window.location.href='{launch_path}'+window.location.search+window.location.hash;\n"
+            f"          return;\n"
+            f"        }}\n"
+            f"        // Update IndexedDB token so worker always has the freshest\n"
+            f"        try{{var _idb=indexedDB.open('_marimo_launcher',1);\n"
+            f"        _idb.onupgradeneeded=function(){{_idb.result.createObjectStore('config')}};\n"
+            f"        _idb.onsuccess=function(){{var _d=_idb.result;\n"
+            f"          var _tx=_d.transaction('config','readwrite');\n"
+            f"          var _st=_tx.objectStore('config');\n"
+            f"          var _g=_st.get('pending');\n"
+            f"          _g.onsuccess=function(){{if(_g.result){{_g.result.token=_lt;_st.put(_g.result,'pending')}}_d.close()}};\n"
+            f"          _g.onerror=function(){{_d.close()}};\n"
+            f"        }};}}catch(e){{}}\n"
+            f"        // Only overwrite <marimo-code> if no #code/ hash — otherwise\n"
+            f"        // fall through to let the hash handler below remove it.\n"
+            f"        var _hh=window.location.hash;\n"
+            f"        if(!_hh||_hh.indexOf('#code/')!==0){{\n"
+            f"          var _el=document.querySelector('marimo-code');\n"
+            f"          if(_el){{_el.textContent=encodeURIComponent(_lc);}}\n"
+            f"        }}\n"
+            f"      }}\n"
+        )
 
     patched = 0
-    for path in Path(output_dir).rglob("index.html"):
+    root = Path(output_dir)
+    for path in root.rglob("index.html"):
         text = path.read_text(errors="ignore")
         if 'data-marimo-share' not in text:
             continue  # Not a notebook page
@@ -2835,6 +2850,12 @@ def patch_index_for_launcher(output_dir):
             patched += 1
             print(f"  ✓ Launcher check already present: {path}")
             continue
+
+        # Compute relative path from this index.html to the root launch.html
+        depth = len(path.parent.relative_to(root).parts)
+        launch_path = ("../" * depth + "launch.html") if depth else "launch.html"
+
+        launcher_js = _launcher_js(launch_path)
 
         # Insert at the top of the IIFE, right after (function(){
         marker = '<script data-marimo-share="true">\n    (function(){'
@@ -2857,7 +2878,7 @@ def patch_index_for_launcher(output_dir):
             'if(ev.data==="auth_expired"){'
             'localStorage.removeItem("_marimo_oauth_token");'
             'localStorage.removeItem("_marimo_notebook");'
-            'window.location.href="launch.html"+window.location.search;'
+            f'window.location.href="{launch_path}"+window.location.search;'
             'return;}'
             'setTimeout(function(){'
             'var b=document.querySelector("[data-testid=\\"file-explorer-refresh-button\\"]");'
@@ -3073,7 +3094,7 @@ def main():
     add_metadata_files(output_dir)
 
     # Step 12: Build launch page (opt-in, creates new file)
-    build_launch_page(output_dir)
+    build_launch_page(output_dir, notebooks)
 
     # Step 13: Build create page (opt-in, creates new file)
     build_create_page(output_dir)
