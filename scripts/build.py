@@ -2981,16 +2981,26 @@ def inject_repo_file_loader(output_dir):
             "+' _d=await _r.bytes()\\n'"
             "+' _p=pathlib.Path(_f);_p.parent.mkdir(parents=True,exist_ok=True);_p.write_bytes(_d)\\n'"
             "+' if _p.parts:_dirs.add(_p.parts[0])\\n'"
-            # Monkey-patch os.chdir so data dirs get symlinked into
-            # whatever CWD marimo creates (e.g. /tmp/marimo_42/).
+            # Monkey-patch os.chdir so data dirs get symlinked/copied
+            # into whatever CWD marimo creates (e.g. /tmp/marimo_42/).
+            "+'print(\\x22[marimo-data] base CWD:\\x22,_base,\\x22dirs:\\x22,_dirs)\\n'"
             "+'_oc=os.chdir\\n'"
             "+'def _mc(p,_oc=_oc,_base=_base,_dirs=_dirs):\\n'"
             "+' _oc(p)\\n'"
             "+' import os as _os\\n'"
+            "+' _cwd=_os.getcwd()\\n'"
+            "+' print(\\x22[marimo-data] chdir to\\x22,_cwd,\\x22- linking data dirs\\x22)\\n'"
             "+' for _d in _dirs:\\n'"
             "+'  _s=_os.path.join(_base,_d)\\n'"
-            "+'  _t=_os.path.join(_os.getcwd(),_d)\\n'"
-            "+'  if _os.path.isdir(_s) and not _os.path.exists(_t):_os.symlink(_s,_t)\\n'"
+            "+'  _t=_os.path.join(_cwd,_d)\\n'"
+            "+'  if not _os.path.isdir(_s):continue\\n'"
+            "+'  if _os.path.exists(_t):continue\\n'"
+            "+'  try:\\n'"
+            "+'   _os.symlink(_s,_t)\\n'"
+            "+'   print(\\x22[marimo-data] symlinked\\x22,_s,\\x22->\\x22,_t)\\n'"
+            "+'  except Exception:\\n'"
+            "+'   import shutil;shutil.copytree(_s,_t)\\n'"
+            "+'   print(\\x22[marimo-data] copied\\x22,_s,\\x22->\\x22,_t)\\n'"
             "+'os.chdir=_mc\\n'"
             "+'del _c,_f,_u,_r,_d,_p\\n';"
             f'await {instance_var}["runPythonAsync"](_py);'
