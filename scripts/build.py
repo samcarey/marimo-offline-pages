@@ -2908,6 +2908,12 @@ def inject_repo_file_loader(output_dir):
     Reads data file config from IndexedDB (stored by launch.html), fetches
     each file from the GitLab API using ``pyfetch`` with Bearer auth, and
     writes them to the Pyodide filesystem before the notebook executes.
+
+    Injects right after ``loadPyodide()`` completes — the same unconditional
+    point used by ``inject_micropip_index``.  An earlier approach used
+    ``_find_runpython_insertion`` (before the first ``runPythonAsync``), but
+    that insertion point is inside a conditional (``a.length>0&&await ...``)
+    which skips the injection when no packages need loading.
     """
     print("\n══════════════════════════════════════════")
     print("Step 11c: Injecting repo file loader into worker JS")
@@ -2924,7 +2930,11 @@ def inject_repo_file_loader(output_dir):
             print(f"  ✓ Repo file loader already present: {path}")
             continue
 
-        instance_var, insert_pos = _find_runpython_insertion(text)
+        # Use loadPyodide completion point — unconditional and early.
+        instance_var, insert_pos = _find_load_pyodide_completion(text)
+        if not instance_var:
+            # Fallback to runPythonAsync (less reliable — may be conditional)
+            instance_var, insert_pos = _find_runpython_insertion(text)
         if not instance_var:
             continue
 
